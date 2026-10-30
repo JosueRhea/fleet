@@ -1,10 +1,10 @@
 #!/bin/bash
 # Reliability run: same real cell as e2e/cell.sh, but breaks one component at a time under live traffic
 # and checks the service keeps serving, the platform converges, and nothing leaks.
-# Needs scripts/build.sh, docker, sudo, /dev/kvm, TEMPORAL_API_KEY and a minio binary (MINIO_BIN).
+# Needs scripts/build.sh, docker, sudo, /dev/kvm, TEMPORAL_API_KEY (or TEMPORAL_ADDRESS=localhost:7233 for a dev server) and a minio binary (MINIO_BIN).
 set -u
 E=$(cd "$(dirname "$0")" && pwd); R=$E/../target/release; C=${CELL_DIR:-/tmp/chaos}; SOAK=${SOAK:-6}
-export TEMPORAL_ADDRESS=us-west-2.aws.api.temporal.io:7233 TEMPORAL_NAMESPACE=ccloud-dev.nhipi
+export TEMPORAL_ADDRESS=${TEMPORAL_ADDRESS:-us-west-2.aws.api.temporal.io:7233} TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-ccloud-dev.nhipi}
 export CCLOUD_S3_ENDPOINT=http://127.0.0.1:9100 CCLOUD_BUCKET=ccloud-chaos-$$ AWS_ACCESS_KEY_ID=ccloud AWS_SECRET_ACCESS_KEY=ccloud-dev-secret
 B=s3://$CCLOUD_BUCKET
 sudo rm -rf $C; mkdir -p $C/bin; cd $C
@@ -14,13 +14,15 @@ minio_down() { kill $(pgrep -x minio); while pgrep -x minio >/dev/null; do sleep
 mkdir -p /tmp/minio-data
 curl -sf -o /dev/null $CCLOUD_S3_ENDPOINT/minio/health/live || minio_up
 for a in v1 v2 crash err; do docker build -q -t webapp:$a $E/app-$a >/dev/null; done
-(cd $E/../orchestrator && go build -o $C/bin/ ./cmd/worker ./cmd/deploy ./cmd/keygen ./cmd/statectl)
+(cd $E/../orchestrator && go build -o $C/bin/ ./cmd/worker ./cmd/deploy ./cmd/keygen ./cmd/statectl ./cmd/hostctl)
 bin/keygen -key signing.key -pub signing.pub
 echo '{"svc-web":{"host":"web.local","port":8000,"health_path":"/health"}}' > services.json
 W="-services services.json -key signing.key"
 worker() { bin/worker $W >> worker.log 2>&1 & WP=$!; }
 worker; sleep 3
 PE=--preserve-env=CCLOUD_S3_ENDPOINT,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY
+# Register each host's box key, read on the host itself (not from its unsigned status report).
+reg() { bin/hostctl add -key signing.key -id $1 -box-pub $(sudo $R/hostd --state-dir $C/$1 box-pub) >/dev/null; }
 host() { sudo $PE $R/hostd --state-dir $C/$1 --slots $2 agent --host-id $1 --memory-mib 1024 --trust signing.pub \
   --doc $B/docs/hosts/$1.json --status $B/status/hosts/$1.json >> $1.log 2>&1 & }
 # Two edges behind a health-checking L4 balancer on :9000 (stand-in for a cloud NLB / anycast).
@@ -43,7 +45,7 @@ backend edges
   server edge-2 127.0.0.1:9002 check
 CFG
 haproxy -f lb.cfg > lb.log 2>&1 & LBP=$!
-host host-a 1-100; host host-b 101-200; edge edge-1 9001; edge edge-2 9002; sleep 4
+reg host-a; reg host-b; host host-a 1-100; host host-b 101-200; edge edge-1 9001; edge edge-2 9002; sleep 4
 load() { while [ -e $C/loadon ]; do p=$(cat $C/phase); r=$(curl -s -m3 -H 'Host: web.local' -w ' %{http_code}' localhost:9000/cgi-bin/app || echo " 000"); echo "$p $r"; sleep 0.01; done >> $C/codes; }
 dep() { bin/deploy $W -service svc-web "$@" 2>&1 | grep -E '"Status"|"Reason"|Fatal|waiting' | tr -s ' ' | cut -c1-200; }
 phase() { echo "$1" > phase; echo; echo "== $1"; }

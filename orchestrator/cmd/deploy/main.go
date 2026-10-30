@@ -30,6 +30,7 @@ func main() {
 	secrets := flag.Int("secrets", -1, "secret set version to pin (-1 = latest, 0 = none)")
 	canary := flag.Int("canary", 0, "route this % of traffic to one new instance first (0 = no canary)")
 	canaryBake := flag.Duration("canary-bake", 30*time.Second, "how long the canary takes its share before promotion")
+	canaryMin := flag.Int("canary-min-requests", 20, "requests the canary must serve during its bake to be judged (negative = no minimum)")
 	rollbackAfter := flag.Duration("rollback-after", 0, "send a rollback signal after this long (0 = never)")
 	flag.Parse()
 	ctx := context.Background()
@@ -55,7 +56,7 @@ func main() {
 	}
 	defer c.Close()
 
-	in := deploy.Input{ServiceID: *service, DeploymentID: *deployment, Image: *image, Replicas: *replicas, MaxSurge: *surge, Bake: *bake, CanaryPercent: *canary, CanaryBake: *canaryBake}
+	in := deploy.Input{ServiceID: *service, DeploymentID: *deployment, Image: *image, Replicas: *replicas, MaxSurge: *surge, Bake: *bake, CanaryPercent: *canary, CanaryBake: *canaryBake, CanaryMinRequests: *canaryMin}
 	in.Old = old
 	if *secrets < 0 {
 		vs, err := store.SecretVersions(ctx, *service)

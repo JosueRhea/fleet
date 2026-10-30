@@ -16,6 +16,9 @@ const HeartbeatTimeout = 10 * time.Second
 // MaxReplacements caps how many batches a deploy re-places after losing their host mid-boot.
 const MaxReplacements = 2
 
+// PlaceAttempts bounds placement retries (1s backoff doubling to 30s: about two minutes).
+const PlaceAttempts = 8
+
 // HostLostType is the ApplicationError type WaitReady uses for ErrHostLost.
 const HostLostType = "HostLost"
 
@@ -39,7 +42,10 @@ type Input struct {
 	// and rolls back before touching any old instance if its error rate is too high.
 	CanaryPercent int
 	CanaryBake    time.Duration
-	Secrets       int // secret set version pinned by this deployment (0 = none)
+	// CanaryMinRequests is how many requests the canary must serve during CanaryBake to be judged;
+	// with fewer it fails rather than being promoted untested. Default 20; negative disables.
+	CanaryMinRequests int
+	Secrets           int // secret set version pinned by this deployment (0 = none)
 }
 
 func (in *Input) applyDefaults() {
@@ -57,6 +63,9 @@ func (in *Input) applyDefaults() {
 	}
 	if in.CanaryPercent > 0 && in.CanaryBake == 0 {
 		in.CanaryBake = 30 * time.Second
+	}
+	if in.CanaryPercent > 0 && in.CanaryMinRequests == 0 {
+		in.CanaryMinRequests = 20
 	}
 	if in.MaxErrorRate == 0 {
 		in.MaxErrorRate = 0.05
@@ -111,7 +120,7 @@ func RollingDeploy(ctx workflow.Context, in Input) (Result, error) {
 		n := min(in.MaxSurge, in.Replicas-len(r.ready))
 		var batch []Instance
 		req := PlaceRequest{ServiceID: in.ServiceID, DeploymentID: in.DeploymentID, Image: in.Image, Secrets: in.Secrets, Count: n}
-		if err := workflow.ExecuteActivity(r.short, a.PlaceInstances, req).Get(ctx, &batch); err != nil {
+		if err := r.place(req, &batch); err != nil {
 			return r.rollBack("placement failed: " + err.Error())
 		}
 		r.created = append(r.created, batch...)
@@ -181,6 +190,17 @@ func (r *rollout) waitCtx(d time.Duration) workflow.Context {
 	})
 }
 
+// place gives up after about two minutes (no live host, no capacity) instead of retrying forever,
+// so the deploy rolls back with the reason rather than hanging.
+func (r *rollout) place(req PlaceRequest, out *[]Instance) error {
+	ctx := workflow.WithActivityOptions(r.ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: time.Minute,
+		HeartbeatTimeout:    HeartbeatTimeout,
+		RetryPolicy:         &temporal.RetryPolicy{InitialInterval: time.Second, MaximumInterval: 30 * time.Second, MaximumAttempts: PlaceAttempts},
+	})
+	return workflow.ExecuteActivity(ctx, a.PlaceInstances, req).Get(r.ctx, out)
+}
+
 func (r *rollout) hosts(c HostChange) error {
 	c.Image = r.in.Image
 	return workflow.ExecuteActivity(r.short, a.PublishHostChange, c).Get(r.ctx, nil)
@@ -230,7 +250,7 @@ func (r *rollout) canary() (Result, bool) {
 		res, _ := r.rollBack(reason)
 		return res, true
 	}
-	if err := workflow.ExecuteActivity(r.short, a.PlaceInstances, req).Get(r.ctx, &batch); err != nil {
+	if err := r.place(req, &batch); err != nil {
 		return fail("canary placement failed: " + err.Error())
 	}
 	r.created = append(r.created, batch...)
@@ -244,7 +264,11 @@ func (r *rollout) canary() (Result, bool) {
 	if err := r.publish(RouteUpdate{Active: r.oldLeft, Canary: batch, CanaryPercent: r.in.CanaryPercent}); err != nil {
 		return fail("routing canary failed: " + err.Error())
 	}
-	if reason, failed := r.watch(r.in.CanaryBake); failed {
+	minRequests := 0
+	if workflow.GetVersion(r.ctx, "canary-min-requests", workflow.DefaultVersion, 1) == 1 {
+		minRequests = r.in.CanaryMinRequests
+	}
+	if reason, failed := r.watch(r.in.CanaryBake, minRequests); failed {
 		return fail("canary: " + reason)
 	}
 	if err := r.routes(r.serving(), nil); err != nil {
@@ -268,10 +292,11 @@ func (r *rollout) rollbackRequested() (string, bool) {
 	return reason, ok
 }
 
-func (r *rollout) bake() (string, bool) { return r.watch(r.in.Bake) }
+func (r *rollout) bake() (string, bool) { return r.watch(r.in.Bake, 0) }
 
-// watch waits d (or a rollback signal), then checks the new deployment's edge error rate.
-func (r *rollout) watch(d time.Duration) (string, bool) {
+// watch waits d (or a rollback signal), then checks the new deployment's edge error rate. With
+// minRequests > 0, a deployment that served fewer requests than that fails: no traffic is no evidence.
+func (r *rollout) watch(d time.Duration, minRequests int) (string, bool) {
 	timerCtx, cancel := workflow.WithCancel(r.ctx)
 	defer cancel()
 	var reason string
@@ -290,8 +315,13 @@ func (r *rollout) watch(d time.Duration) (string, bool) {
 	if err := workflow.ExecuteActivity(r.short, a.CheckHealth, r.in.ServiceID, r.in.DeploymentID).Get(r.ctx, &h); err != nil {
 		return "health check failed: " + err.Error(), true
 	}
+	// Errors are evidence even on a few requests (the edge ejects a failing backend quickly, so a
+	// bad canary may serve only a handful); too few requests only blocks promotion.
 	if h.ErrorRate > r.in.MaxErrorRate {
 		return fmt.Sprintf("error rate %.1f%% above %.1f%%", h.ErrorRate*100, r.in.MaxErrorRate*100), true
+	}
+	if minRequests > 0 && h.Requests < int64(minRequests) {
+		return fmt.Sprintf("served %d requests in %s, need %d to judge it", h.Requests, d, minRequests), true
 	}
 	return "", false
 }

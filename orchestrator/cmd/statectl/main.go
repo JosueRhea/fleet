@@ -26,11 +26,11 @@ func main() {
 	}
 	key := os.Args[2]
 	if os.Args[1] == "list" {
-		objs, err := st.List(ctx, key)
+		keys, err := st.Keys(ctx, key)
 		if err != nil {
 			log.Fatal(err)
 		}
-		for k := range objs {
+		for _, k := range keys {
 			fmt.Println(k)
 		}
 		return

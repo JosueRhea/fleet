@@ -46,6 +46,7 @@ type RouteUpdate struct {
 
 type HealthReport struct {
 	ErrorRate float64
+	Requests  int64 // requests the error rate is over
 }
 
 // LostReport splits a service's routed instances by whether their host is still reporting.

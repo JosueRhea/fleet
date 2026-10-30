@@ -79,19 +79,47 @@ func (s *Store) Put(ctx context.Context, key string, b []byte) error {
 	return err
 }
 
-// List returns the contents of every object under prefix, keyed by object name.
-func (s *Store) List(ctx context.Context, prefix string) (map[string][]byte, error) {
-	out := map[string][]byte{}
+// ErrExists is returned by PutNew when the key is already taken.
+var ErrExists = errors.New("object already exists")
+
+// PutNew writes key only if it does not exist yet (If-None-Match: *), so two writers can't both
+// claim it.
+func (s *Store) PutNew(ctx context.Context, key string, b []byte) error {
+	opts := minio.PutObjectOptions{ContentType: "application/json"}
+	opts.SetMatchETagExcept("*")
+	_, err := s.c.PutObject(ctx, s.bucket, key, bytes.NewReader(b), int64(len(b)), opts)
+	if minio.ToErrorResponse(err).Code == "PreconditionFailed" {
+		return fmt.Errorf("%s: %w", key, ErrExists)
+	}
+	return err
+}
+
+// Keys returns the names of the objects under prefix, without reading them.
+func (s *Store) Keys(ctx context.Context, prefix string) ([]string, error) {
+	var out []string
 	for o := range s.c.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
 		if o.Err != nil {
 			return nil, o.Err
 		}
-		b, err := s.Get(ctx, o.Key)
+		out = append(out, o.Key)
+	}
+	return out, nil
+}
+
+// List returns the contents of every object under prefix, keyed by object name.
+func (s *Store) List(ctx context.Context, prefix string) (map[string][]byte, error) {
+	keys, err := s.Keys(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]byte{}
+	for _, k := range keys {
+		b, err := s.Get(ctx, k)
 		if err != nil {
 			return nil, err
 		}
 		if b != nil {
-			out[o.Key] = b
+			out[k] = b
 		}
 	}
 	return out, nil

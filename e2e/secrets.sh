@@ -2,22 +2,24 @@
 # Secrets end to end: secretctl seals a set to the cell key; the worker re-seals it to the host that
 # runs each instance; hostd opens it right before boot. Checks the app sees it, no plaintext is in the
 # state bucket, and rotating (new version = new deploy) has no downtime.
-# Needs scripts/build.sh, docker, sudo, /dev/kvm, TEMPORAL_API_KEY and a minio binary (MINIO_BIN).
+# Needs scripts/build.sh, docker, sudo, /dev/kvm, TEMPORAL_API_KEY (or TEMPORAL_ADDRESS=localhost:7233 for a dev server) and a minio binary (MINIO_BIN).
 set -u
 E=$(cd "$(dirname "$0")" && pwd); R=$E/../target/release; C=${CELL_DIR:-/tmp/secrets}
-export TEMPORAL_ADDRESS=us-west-2.aws.api.temporal.io:7233 TEMPORAL_NAMESPACE=ccloud-dev.nhipi
+export TEMPORAL_ADDRESS=${TEMPORAL_ADDRESS:-us-west-2.aws.api.temporal.io:7233} TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-ccloud-dev.nhipi}
 export CCLOUD_S3_ENDPOINT=http://127.0.0.1:9100 CCLOUD_BUCKET=ccloud-secrets-$$ AWS_ACCESS_KEY_ID=ccloud AWS_SECRET_ACCESS_KEY=ccloud-dev-secret
 B=s3://$CCLOUD_BUCKET
 sudo rm -rf $C; mkdir -p $C/bin /tmp/minio-data; cd $C
 curl -sf -o /dev/null $CCLOUD_S3_ENDPOINT/minio/health/live || { MINIO_ROOT_USER=$AWS_ACCESS_KEY_ID MINIO_ROOT_PASSWORD=$AWS_SECRET_ACCESS_KEY setsid ${MINIO_BIN:-minio} server /tmp/minio-data --address 127.0.0.1:9100 >> minio.log 2>&1 & sleep 3; }
 docker build -q -t webapp:secret $E/app-secret >/dev/null
-(cd $E/../orchestrator && go build -o $C/bin/ ./cmd/worker ./cmd/deploy ./cmd/keygen ./cmd/statectl ./cmd/secretctl)
+(cd $E/../orchestrator && go build -o $C/bin/ ./cmd/worker ./cmd/deploy ./cmd/keygen ./cmd/statectl ./cmd/secretctl ./cmd/hostctl)
 bin/keygen -key signing.key -pub signing.pub; bin/secretctl keygen -key secrets.key -pub secrets.pub
 echo '{"svc-web":{"host":"web.local","port":8000,"health_path":"/health"}}' > services.json
 W="-services services.json -key signing.key"
 bin/worker $W -secrets-key secrets.key >> worker.log 2>&1 & WP=$!
 PE=--preserve-env=CCLOUD_S3_ENDPOINT,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY
 for h in host-a:1-100 host-b:101-200; do id=${h%%:*}
+  # Register the box key read on the host itself (not from its unsigned status report).
+  bin/hostctl add -key signing.key -id $id -box-pub $(sudo $R/hostd --state-dir $C/$id box-pub) >/dev/null
   sudo $PE $R/hostd --state-dir $C/$id --slots ${h#*:} agent --host-id $id --memory-mib 1024 --trust signing.pub \
     --doc $B/docs/hosts/$id.json --status $B/status/hosts/$id.json >> $id.log 2>&1 &
 done
@@ -47,6 +49,26 @@ echo "  non-200: $(awk '$NF!=200' codes | wc -l) of $(wc -l < codes)"
 
 echo "== pinned old version (rollback to secrets v1)"; dep -secrets 1; echo "  app sees: $(get)"
 echo "== missing version (expect rolled_back, v1 keeps serving)"; dep -secrets 9; echo "  app sees: $(get)"
+
+echo "== impostor host: unregistered status with an attacker box key and lots of free memory"
+bin/secretctl keygen -key evil.key -pub evil.pub
+imp() { while [ -e impon ]; do printf '{"host_id":"evil","box_pub":"%s","reported_at":%d,"memory_mib_total":999999,"memory_mib_used":0,"applied_version":0,"instances":[]}' \
+  "$(cat evil.pub)" "$(date +%s)" | bin/statectl put status/hosts/evil.json; sleep 1; done; }
+touch impon; imp & IP=$!; sleep 2; dep -secrets 1; rm impon; wait $IP
+echo "  doc published for evil: $(bin/statectl get docs/hosts/evil.json >/dev/null 2>&1 && echo yes || echo no) (expect no)"
+echo "  app sees: $(get)"
+
+echo "== app prints its password and exits (expect rolled_back, no plaintext anywhere)"
+docker build -q -t webapp:secret-crash $E/app-secret-crash >/dev/null
+# The console tail of a failed boot goes into the host's status report: capture those while it fails.
+touch caton; (while [ -e caton ]; do for h in host-a host-b; do bin/statectl get status/hosts/$h.json; echo; done; sleep 0.5; done > crash-status) & CP=$!
+r=$(bin/deploy $W -service svc-web -image webapp:secret-crash -replicas 2 -bake 3s -secrets 1 2>&1)
+rm caton; wait $CP
+echo "$r" | grep -E '"Status"' | tr -s ' '
+echo "  status reports with the redacted console line: $(grep -c 'password \*\*\*' crash-status) (expect > 0)"
+echo "  plaintext in status reports: $(grep -c hunter2 crash-status), in deploy result: $(echo "$r" | grep -c hunter2) (expect 0, 0)"
+leaks hunter2-v1
+echo "  worker log lines containing a secret: $(grep -c hunter2 worker.log)"
 
 echo "== host disk"; echo "  cached images containing a secret: $(sudo grep -rl hunter2 $C/host-a/images $C/host-b/images | wc -l) (expect 0)"
 echo "== shutdown"; sudo kill -INT $(pgrep -x hostd); kill $WP $EP; sleep 4

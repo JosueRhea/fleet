@@ -469,14 +469,22 @@ impl BoxKey {
         }
         let mut b = [0u8; 32];
         std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut b)?;
+        // Write a temp file and link it into place, so a crash never leaves an empty or partial key.
         use std::os::unix::fs::OpenOptionsExt;
+        let tmp = path.with_extension("tmp");
+        let _ = std::fs::remove_file(&tmp);
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(path)
-            .with_context(|| format!("creating {}", path.display()))?;
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
         std::io::Write::write_all(&mut f, to_hex(&b).as_bytes())?;
+        f.sync_all()?;
+        // hard_link (unlike rename) fails if the key exists, e.g. present but unreadable: never replace it.
+        let linked = std::fs::hard_link(&tmp, path);
+        let _ = std::fs::remove_file(&tmp);
+        linked.with_context(|| format!("creating {}", path.display()))?;
         Ok(BoxKey(crypto_box::SecretKey::from(b)))
     }
 

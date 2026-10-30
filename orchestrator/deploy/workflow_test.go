@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -192,4 +193,45 @@ func TestBadCanaryRollsBackWithoutTouchingOld(t *testing.T) {
 		require.NotContains(t, e, "sleep old")
 	}
 	require.Contains(t, f.Events(), "stop ins-d2-1")
+}
+
+func TestCanaryWithoutTrafficIsNotPromoted(t *testing.T) {
+	f := &FakeCluster{NoTraffic: true}
+	in := input("app:v2")
+	in.CanaryPercent = 10
+	res := run(t, f, in, nil)
+	require.Equal(t, StatusRolledBack, res.Status)
+	require.Contains(t, res.Reason, "canary: served 0 requests")
+	require.Equal(t, "old-1,old-2", ids(res.Active))
+}
+
+func TestCanaryMinRequestsCanBeDisabled(t *testing.T) {
+	f := &FakeCluster{NoTraffic: true}
+	in := input("app:v2")
+	in.CanaryPercent = 10
+	in.CanaryMinRequests = -1
+	require.Equal(t, StatusActive, run(t, f, in, nil).Status)
+}
+
+func TestPlacementGivesUpInsteadOfHanging(t *testing.T) {
+	f := &FakeCluster{PlaceErr: errors.New("no live registered hosts")}
+	res := run(t, f, input("app:v2"), nil)
+	require.Equal(t, StatusRolledBack, res.Status)
+	require.Contains(t, res.Reason, "no live registered hosts")
+	n := 0
+	for _, e := range f.Events() {
+		if e == "place failed" {
+			n++
+		}
+	}
+	require.Equal(t, PlaceAttempts, n)
+}
+
+func TestFailingCanaryReportsErrorRateEvenOnFewRequests(t *testing.T) {
+	f := &FakeCluster{ErrorRate: 1, Requests: 10} // the edge ejected it after a few 5xx
+	in := input("app:v2")
+	in.CanaryPercent = 10
+	res := run(t, f, in, nil)
+	require.Equal(t, StatusRolledBack, res.Status)
+	require.Contains(t, res.Reason, "canary: error rate 100.0%")
 }

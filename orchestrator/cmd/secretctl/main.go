@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -57,16 +58,25 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		vs, err := store.SecretVersions(ctx, *service)
-		if err != nil {
-			log.Fatal(err)
-		}
-		v := 1
-		if len(vs) > 0 {
-			v = vs[len(vs)-1] + 1
-		}
-		if err := store.Put(ctx, cellstate.SecretsKey(*service, v), []byte(sealed)); err != nil {
-			log.Fatal(err)
+		// Versions are immutable: claim the next one with a create-only write, and if another
+		// secretctl got there first, take the one after it.
+		var v int
+		for attempt := 0; ; attempt++ {
+			vs, err := store.SecretVersions(ctx, *service)
+			if err != nil {
+				log.Fatal(err)
+			}
+			v = 1
+			if len(vs) > 0 {
+				v = vs[len(vs)-1] + 1
+			}
+			err = store.PutNew(ctx, cellstate.SecretsKey(*service, v), []byte(sealed))
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, cellstate.ErrExists) || attempt == 4 {
+				log.Fatal(err)
+			}
 		}
 		fmt.Printf("%s secrets v%d (%d keys)\n", *service, v, len(env))
 	default:

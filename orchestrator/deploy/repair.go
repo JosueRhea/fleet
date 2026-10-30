@@ -64,7 +64,7 @@ func Repair(ctx workflow.Context, in RepairInput) (RepairResult, error) {
 	for _, g := range order {
 		var batch []Instance
 		req := PlaceRequest{ServiceID: in.ServiceID, DeploymentID: g.deployment, Image: g.image, Secrets: g.secrets, Count: counts[g]}
-		if err := workflow.ExecuteActivity(r.short, a.PlaceInstances, req).Get(ctx, &batch); err != nil {
+		if err := r.place(req, &batch); err != nil {
 			return RepairResult{Active: rep.Healthy, Reason: "placement failed: " + err.Error()}, nil
 		}
 		fresh = append(fresh, batch...)
