@@ -2,7 +2,7 @@
 name = "microinit"
 version = "0.1.0"
 edition = "2021"
-description = "PID 1 for microrail guests: mounts, loopback, runs the image entrypoint, reaps zombies"
+description = "PID 1 for ccloud guests: mounts, loopback, runs the image entrypoint, reaps zombies"
 
 [dependencies]
 libc = "0.2"

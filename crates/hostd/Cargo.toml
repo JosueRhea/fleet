@@ -2,7 +2,7 @@
 name = "hostd"
 version = "0.1.0"
 edition = "2021"
-description = "microrail host agent: OCI image -> Firecracker microVM, TAP networking, scale-to-zero via snapshots"
+description = "ccloud host agent: OCI image -> Firecracker microVM, TAP networking, scale-to-zero via snapshots"
 
 [dependencies]
 anyhow = "1"

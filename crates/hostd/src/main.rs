@@ -18,16 +18,16 @@ use tokio::sync::Mutex;
 use vm::{wait_tcp, Paths, Vm};
 
 #[derive(Parser)]
-#[command(about = "microrail host agent")]
+#[command(about = "ccloud host agent")]
 struct Cli {
-    #[arg(long, default_value = "/var/lib/microrail", global = true)]
+    #[arg(long, default_value = "/var/lib/ccloud", global = true)]
     state_dir: PathBuf,
     #[arg(long, default_value = "/usr/local/bin/firecracker", global = true)]
     firecracker: PathBuf,
-    #[arg(long, env = "MICRORAIL_KERNEL", default_value = "/var/lib/microrail/vmlinux", global = true)]
+    #[arg(long, env = "CCLOUD_KERNEL", default_value = "/var/lib/ccloud/vmlinux", global = true)]
     kernel: PathBuf,
     /// Guest PID 1 binary; defaults to `microinit` next to this executable.
-    #[arg(long, env = "MICRORAIL_INIT", global = true)]
+    #[arg(long, env = "CCLOUD_INIT", global = true)]
     init: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,

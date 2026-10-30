@@ -1,4 +1,4 @@
-# microrail
+# ccloud
 
 Single-host spike for a microVM-first Railway alternative. It turns an OCI image into a Firecracker microVM, puts it on its own TAP network, proxies a host port to it, and scales it to zero with memory snapshots.
 
@@ -7,7 +7,7 @@ Single-host spike for a microVM-first Railway alternative. It turns an OCI image
 | Piece | What it does |
 |---|---|
 | `crates/hostd` | Host agent (Rust). Converts images, boots VMs through the Firecracker API, sets up TAP + NAT, runs an L4 proxy that wakes sleeping VMs, and reconciles a desired-state file. |
-| `crates/microinit` | Static musl PID 1 for the guest. Mounts `/proc`, `/sys`, `/dev`; brings up loopback; runs the image's entrypoint/cmd/env/workdir/user from `/etc/microrail/run.json`; reaps zombies; powers off when the app exits. |
+| `crates/microinit` | Static musl PID 1 for the guest. Mounts `/proc`, `/sys`, `/dev`; brings up loopback; runs the image's entrypoint/cmd/env/workdir/user from `/etc/ccloud/run.json`; reaps zombies; powers off when the app exits. |
 | `examples/` | `services.json` desired-state file, and a small Node app that keeps an in-memory counter (to show RAM survives sleep/wake). |
 
 ### How a deploy works
@@ -20,7 +20,7 @@ Single-host spike for a microVM-first Railway alternative. It turns an OCI image
 After `idle_sleep_secs` with no open connections, hostd pauses the VM, writes a full snapshot (device state + RAM), and kills Firecracker. The next connection is held, the snapshot is restored, and then the connection is forwarded.
 
 ### Static stability (the main lesson from Railway's incidents)
-- `up` re-reads the spec every 3s. If the spec is missing or invalid, hostd keeps running the **last-known-good** copy (`/var/lib/microrail/last-good-spec.json`) instead of tearing anything down.
+- `up` re-reads the spec every 3s. If the spec is missing or invalid, hostd keeps running the **last-known-good** copy (`/var/lib/ccloud/last-good-spec.json`) instead of tearing anything down.
 - A crashed VM is cold-booted again locally by the watchdog. This needs no control plane.
 
 ## Results (nested KVM on an 8-vCPU AWS VM, Firecracker v1.17, guest kernel 6.1, 1 vCPU / 256 MiB)
@@ -46,7 +46,7 @@ This was measured on nested virtualization; expect bare metal to be faster. Cold
 ## Run it
 
 ```bash
-./scripts/fetch-kernel.sh          # firecracker -> /usr/local/bin, kernel -> /var/lib/microrail/vmlinux
+./scripts/fetch-kernel.sh          # firecracker -> /usr/local/bin, kernel -> /var/lib/ccloud/vmlinux
 ./scripts/build.sh                 # target/release/{hostd,microinit}
 docker build -t hello-node examples/hello-node
 sudo ./target/release/hostd bench public.ecr.aws/docker/library/nginx:alpine --port 80
@@ -61,5 +61,5 @@ Requires Linux with `/dev/kvm`, Docker (for pulling/exporting images), `iptables
 - Images go through Docker. Next step: pull OCI layers directly and build rootfs without a daemon (or use a block-level layer cache).
 - Restore uses a full RAM file. Next: diff snapshots + UFFD/lazy page loading, plus pre-warmed snapshots taken right after "port ready" so cold deploys become restores.
 - Networking is IPv4 /30 + NAT per VM. The design calls for IPv6 per VM plus a WireGuard mesh between hosts.
-- No volumes, no metrics, no log shipping (the console log is at `/var/lib/microrail/vms/<name>/console.log`), and no cross-host scheduler or control plane.
+- No volumes, no metrics, no log shipping (the console log is at `/var/lib/ccloud/vms/<name>/console.log`), and no cross-host scheduler or control plane.
 - Cloud Hypervisor backend for long-lived services.

@@ -1,4 +1,4 @@
-//! Guest PID 1. hostd bakes `/etc/microrail/run.json` (the OCI image config) into the rootfs.
+//! Guest PID 1. hostd bakes `/etc/ccloud/run.json` (the OCI image config) into the rootfs.
 
 use serde::Deserialize;
 use std::ffi::CString;
@@ -89,13 +89,13 @@ fn main() {
     mount("tmpfs", "/run", "tmpfs", 0, "");
     loopback_up();
 
-    let run: Run = match std::fs::read("/etc/microrail/run.json")
+    let run: Run = match std::fs::read("/etc/ccloud/run.json")
         .map_err(|e| e.to_string())
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("microinit: bad /etc/microrail/run.json: {e}");
+            eprintln!("microinit: bad /etc/ccloud/run.json: {e}");
             shutdown();
         }
     };

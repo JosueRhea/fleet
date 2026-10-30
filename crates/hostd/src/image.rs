@@ -69,9 +69,9 @@ pub fn prepare(reference: &str, extra_env: &[(String, String)], hostname: &str, 
     }
 
     std::fs::create_dir_all(work.join("sbin"))?;
-    std::fs::create_dir_all(work.join("etc/microrail"))?;
+    std::fs::create_dir_all(work.join("etc/ccloud"))?;
     std::fs::copy(init, work.join("sbin/microinit"))?;
-    std::fs::write(work.join("etc/microrail/run.json"), serde_json::to_vec_pretty(&run)?)?;
+    std::fs::write(work.join("etc/ccloud/run.json"), serde_json::to_vec_pretty(&run)?)?;
     let resolv = work.join("etc/resolv.conf");
     let _ = std::fs::remove_file(&resolv);
     std::fs::write(resolv, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n")?;
