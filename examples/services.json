@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "name": "web", "image": "public.ecr.aws/docker/library/nginx:alpine", "port": 80, "public_port": 8080, "idle_sleep_secs": 0 },
+    { "name": "api", "image": "hello-node:latest", "port": 3000, "public_port": 8081, "memory_mib": 256, "idle_sleep_secs": 5 }
+  ]
+}
