@@ -16,6 +16,7 @@ type FakeCluster struct {
 	ErrorRate      float64
 	Logf           func(format string, args ...any)
 	LostReport     LostReport
+	LoseHostOnce   bool // the first WaitReady reports the batch's host as lost
 
 	mu      sync.Mutex
 	events  []string
@@ -78,6 +79,12 @@ func (f *FakeCluster) PublishHosts(_ context.Context, c HostChange) error {
 func (f *FakeCluster) WaitReady(_ context.Context, ins []Instance, _ time.Duration) error {
 	time.Sleep(f.Delay)
 	f.mu.Lock()
+	if f.LoseHostOnce {
+		f.LoseHostOnce = false
+		f.mu.Unlock()
+		f.record("lost %s", ids(ins))
+		return fmt.Errorf("%w: %s stopped reporting", ErrHostLost, ins[0].Host)
+	}
 	for _, i := range ins {
 		if f.FailReadyImage != "" && strings.Contains(f.images[i.ID], f.FailReadyImage) {
 			f.mu.Unlock()

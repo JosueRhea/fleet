@@ -2,6 +2,7 @@
 package deploy
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,6 +12,12 @@ import (
 
 // HeartbeatTimeout bounds how long a step can stall on a dead worker before Temporal retries it elsewhere.
 const HeartbeatTimeout = 10 * time.Second
+
+// MaxReplacements caps how many batches a deploy re-places after losing their host mid-boot.
+const MaxReplacements = 2
+
+// HostLostType is the ApplicationError type WaitReady uses for ErrHostLost.
+const HostLostType = "HostLost"
 
 const (
 	TaskQueue      = "ccloud-deploy"
@@ -82,6 +89,7 @@ func RollingDeploy(ctx workflow.Context, in Input) (Result, error) {
 		oldLeft:    append([]Instance(nil), in.Old...),
 	}
 
+	replaced := 0
 	for len(r.ready) < in.Replicas {
 		if reason, ok := r.rollbackRequested(); ok {
 			return r.rollBack("rollback requested: " + reason)
@@ -97,6 +105,15 @@ func RollingDeploy(ctx workflow.Context, in Input) (Result, error) {
 			return r.rollBack("publishing new instances failed: " + err.Error())
 		}
 		if err := r.waitReady(batch); err != nil {
+			var ae *temporal.ApplicationError
+			if errors.As(err, &ae) && ae.Type() == HostLostType && replaced < MaxReplacements {
+				replaced++
+				workflow.GetLogger(ctx).Warn("host lost while booting; re-placing batch", "err", err)
+				if err := r.hosts(HostChange{Stop: batch}); err != nil {
+					return r.rollBack("stopping instances on a lost host failed: " + err.Error())
+				}
+				continue
+			}
 			return r.rollBack("new instances never became ready: " + err.Error())
 		}
 		r.ready = append(r.ready, batch...)
@@ -176,6 +193,9 @@ func (r *rollout) retire(old []Instance) error {
 	if err := workflow.ExecuteActivity(r.waitCtx(r.in.DrainTimeout), a.WaitDrained, old, r.in.DrainTimeout).Get(r.ctx, nil); err != nil {
 		return err
 	}
+	if err := r.routes(r.serving(), nil); err != nil { // drained: drop them from the edge doc
+		return err
+	}
 	if err := r.hosts(HostChange{Sleep: old}); err != nil {
 		return err
 	}
@@ -236,6 +256,9 @@ func (r *rollout) rollBack(reason string) (Result, error) {
 			return fail(err)
 		}
 		if err := workflow.ExecuteActivity(r.waitCtx(r.in.DrainTimeout), a.WaitDrained, r.ready, r.in.DrainTimeout).Get(r.ctx, nil); err != nil {
+			return fail(err)
+		}
+		if err := r.routes(r.oldLeft, nil); err != nil {
 			return fail(err)
 		}
 	}

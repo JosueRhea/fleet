@@ -51,6 +51,9 @@ type LostReport struct {
 
 var ErrNotReady = errors.New("instances not ready")
 
+// ErrHostLost means an instance's host stopped reporting while it was booting; the deploy re-places it.
+var ErrHostLost = errors.New("host lost")
+
 // Cluster is everything the deploy workflow needs from the rest of the cell
 // (scheduler, state publisher, status ingest). The workflow never talks to hosts or edges directly.
 type Cluster interface {
@@ -78,6 +81,9 @@ func (a *Activities) PublishHostChange(ctx context.Context, change HostChange) e
 
 func (a *Activities) WaitReady(ctx context.Context, ins []Instance, timeout time.Duration) error {
 	err := a.Cluster.WaitReady(ctx, ins, timeout)
+	if errors.Is(err, ErrHostLost) {
+		return temporal.NewNonRetryableApplicationError(err.Error(), HostLostType, err)
+	}
 	if errors.Is(err, ErrNotReady) {
 		return temporal.NewNonRetryableApplicationError(err.Error(), "NotReady", err)
 	}

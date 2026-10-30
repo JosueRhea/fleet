@@ -115,9 +115,9 @@ Same real cell as `e2e/cell.sh`; breaks one component at a time under curl every
 |---|---|---|
 | worker `kill -9` mid-deploy, restarted 6 s later | rollout resumes on the new worker (activities heartbeat, `HeartbeatTimeout` 10 s) and goes active | 0 |
 | state bucket (MinIO) down 20 s | traffic keeps serving from last-good; no false repairs when it returns; next deploy works | 0 |
-| edge `kill -9` + restart | restores last-good routes from its state dir | ~1 s gap (single edge) |
+| edge-1 `kill -9` (2 edges behind haproxy on :9000), deploy while it's dead, restart | balancer fails over to edge-2; `WaitEdgeAck` only waits on edges with fresh status; edge-1 comes back with last-good routes | 0 |
 | hostd `kill -9` + restart | stale Firecracker processes from the old agent are reaped, no leaked VMs | 0 |
-| host killed mid-deploy | rollout rolls back, traffic stays on the surviving host; host comes back running nothing | 0 |
+| host killed mid-deploy | `WaitReady` returns `HostLost`; the batch is stopped and re-placed on the surviving host (up to `MaxReplacements`), rollout goes active; host comes back running nothing | 0 |
 | 6 back-to-back deploys + a crash deploy | all active / rolled back | 0 |
 
-Shutdown leaves `procs=0 taps=0 vmdirs=0`.
+Drained backends are removed from the edge doc after each drain. 0 of 9281 requests failed; shutdown leaves `procs=0 taps=0 vmdirs=0`. Needs `haproxy` for the balancer.

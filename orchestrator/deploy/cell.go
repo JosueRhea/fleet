@@ -297,7 +297,7 @@ func (c *Cell) WaitReady(ctx context.Context, ins []Instance, timeout time.Durat
 				return fmt.Errorf("%w: %s on %s failed: %.300s", ErrNotReady, in.ID, in.Host, s.Error)
 			}
 			if h, ok := hs[in.Host]; ok && !fresh(h.ReportedAt) {
-				return fmt.Errorf("%w: host %s stopped reporting", ErrNotReady, in.Host)
+				return fmt.Errorf("%w: %s stopped reporting while %s booted", ErrHostLost, in.Host, in.ID)
 			}
 			if s.State == "ready" {
 				ready++

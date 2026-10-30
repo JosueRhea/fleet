@@ -49,15 +49,19 @@ func TestRollingDeploySwapsOneAtATime(t *testing.T) {
 		"routes v2 active=ins-d2-1,old-2 draining=old-1",
 		"ack v2",
 		"drained old-1",
+		"routes v3 active=ins-d2-1,old-2 draining=",
+		"ack v3",
 		"sleep old-1",
 		"place 1",
 		"start ins-d2-2",
 		"ready ins-d2-2",
-		"routes v3 active=ins-d2-1,ins-d2-2,old-2 draining=",
-		"ack v3",
-		"routes v4 active=ins-d2-1,ins-d2-2 draining=old-2",
+		"routes v4 active=ins-d2-1,ins-d2-2,old-2 draining=",
 		"ack v4",
+		"routes v5 active=ins-d2-1,ins-d2-2 draining=old-2",
+		"ack v5",
 		"drained old-2",
+		"routes v6 active=ins-d2-1,ins-d2-2 draining=",
+		"ack v6",
 		"sleep old-2",
 		"stop old-1,old-2",
 	}, f.Events())
@@ -83,11 +87,13 @@ func TestRollbackSignalDuringBakeWakesOldInstances(t *testing.T) {
 	require.Equal(t, []string{
 		"wake old-1,old-2",
 		"ready old-1,old-2",
-		"routes v5 active=old-1,old-2 draining=ins-d2-1,ins-d2-2",
-		"ack v5",
+		"routes v7 active=old-1,old-2 draining=ins-d2-1,ins-d2-2",
+		"ack v7",
 		"drained ins-d2-1,ins-d2-2",
+		"routes v8 active=old-1,old-2 draining=",
+		"ack v8",
 		"stop ins-d2-1,ins-d2-2",
-	}, ev[len(ev)-6:])
+	}, ev[len(ev)-8:])
 }
 
 func TestHighErrorRateAfterBakeRollsBack(t *testing.T) {
@@ -105,6 +111,14 @@ func TestFirstDeployHasNoOldInstances(t *testing.T) {
 	res := run(t, f, in, nil)
 	require.Equal(t, StatusActive, res.Status)
 	require.Equal(t, "ins-d2-1,ins-d2-2", ids(res.Active))
+}
+
+func TestHostLostWhileBootingReplacesBatch(t *testing.T) {
+	f := &FakeCluster{LoseHostOnce: true}
+	res := run(t, f, input("app:v2"), nil)
+	require.Equal(t, StatusActive, res.Status)
+	require.Equal(t, "ins-d2-2,ins-d2-3", ids(res.Active))
+	require.Equal(t, []string{"place 1", "start ins-d2-1", "lost ins-d2-1", "stop ins-d2-1", "place 1", "start ins-d2-2", "ready ins-d2-2"}, f.Events()[:7])
 }
 
 func TestRepairReplacesInstancesOnLostHosts(t *testing.T) {
