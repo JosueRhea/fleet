@@ -28,7 +28,12 @@ struct Cli {
     state_dir: PathBuf,
     #[arg(long, default_value = "/usr/local/bin/firecracker", global = true)]
     firecracker: PathBuf,
-    #[arg(long, env = "CCLOUD_KERNEL", default_value = "/var/lib/ccloud/vmlinux", global = true)]
+    #[arg(
+        long,
+        env = "CCLOUD_KERNEL",
+        default_value = "/var/lib/ccloud/vmlinux",
+        global = true
+    )]
     kernel: PathBuf,
     /// Guest PID 1 binary; defaults to `microinit` next to this executable.
     #[arg(long, env = "CCLOUD_INIT", global = true)]
@@ -62,6 +67,9 @@ enum Cmd {
         /// Memory this host offers to instances (reported to the scheduler).
         #[arg(long, default_value_t = 4096)]
         memory_mib: u32,
+        /// This host's X25519 key for secrets sealed to it (default: <state-dir>/host-box.key, created if missing).
+        #[arg(long)]
+        box_key: Option<PathBuf>,
     },
     /// Measure cold boot vs snapshot sleep/wake for one image.
     Bench {
@@ -109,6 +117,9 @@ struct ServiceSpec {
     drain_secs: u64,
     #[serde(default = "default_liveness")]
     liveness_secs: u64,
+    /// Opened secrets; never baked into the (cached) image, only handed to the VM on its own drive.
+    #[serde(skip)]
+    secret_env: BTreeMap<String, String>,
 }
 
 fn default_ready_timeout() -> u64 {
@@ -140,7 +151,11 @@ struct Ctx {
 impl Ctx {
     fn alloc_slot(&self) -> Result<u8> {
         let mut used = self.slots.lock().unwrap();
-        let idx = self.slot_range.clone().find(|i| !used.contains(i)).context("out of VM slots")?;
+        let idx = self
+            .slot_range
+            .clone()
+            .find(|i| !used.contains(i))
+            .context("out of VM slots")?;
         used.insert(idx);
         Ok(idx)
     }
@@ -151,15 +166,33 @@ impl Ctx {
         self.slots.lock().unwrap().remove(&idx);
     }
 
-    fn image(&self, reference: &str, env: &BTreeMap<String, String>, hostname: &str) -> Result<image::Image> {
+    fn image(
+        &self,
+        reference: &str,
+        env: &BTreeMap<String, String>,
+        hostname: &str,
+    ) -> Result<image::Image> {
         let env: Vec<_> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        image::prepare(reference, &env, hostname, &self.init, &self.state_dir.join("images"))
+        image::prepare(
+            reference,
+            &env,
+            hostname,
+            &self.init,
+            &self.state_dir.join("images"),
+        )
     }
 }
 
 fn log(msg: impl AsRef<str>) {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-    eprintln!("[{}.{:03}] {}", t.as_secs(), t.subsec_millis(), msg.as_ref());
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    eprintln!(
+        "[{}.{:03}] {}",
+        t.as_secs(),
+        t.subsec_millis(),
+        msg.as_ref()
+    );
 }
 
 fn ms(d: Duration) -> String {
@@ -177,16 +210,33 @@ async fn main() -> Result<()> {
         None => std::env::current_exe()?.with_file_name("microinit"),
     };
     if !init.exists() {
-        bail!("guest init not found at {} (run scripts/build.sh)", init.display());
+        bail!(
+            "guest init not found at {} (run scripts/build.sh)",
+            init.display()
+        );
     }
     let head = std::fs::read(&init)?;
-    if head.windows(8).take(4096).any(|w| w == b"/lib64/l" || w == b"/lib/ld-") {
-        bail!("guest init {} is dynamically linked; build it for musl (scripts/build.sh)", init.display());
+    if head
+        .windows(8)
+        .take(4096)
+        .any(|w| w == b"/lib64/l" || w == b"/lib/ld-")
+    {
+        bail!(
+            "guest init {} is dynamically linked; build it for musl (scripts/build.sh)",
+            init.display()
+        );
     }
     if !cli.kernel.exists() {
-        bail!("guest kernel not found at {} (run scripts/fetch-kernel.sh)", cli.kernel.display());
+        bail!(
+            "guest kernel not found at {} (run scripts/fetch-kernel.sh)",
+            cli.kernel.display()
+        );
     }
-    let slot_range = match cli.slots.split_once('-').map(|(a, b)| (a.parse::<u8>(), b.parse::<u8>())) {
+    let slot_range = match cli
+        .slots
+        .split_once('-')
+        .map(|(a, b)| (a.parse::<u8>(), b.parse::<u8>()))
+    {
         Some((Ok(a), Ok(b))) if a >= 1 && a <= b && b <= 249 => a..=b,
         _ => bail!("--slots wants a range like 1-120 within 1-249"),
     };
@@ -194,7 +244,10 @@ async fn main() -> Result<()> {
         slots: Default::default(),
         slot_range,
         next_gen: Default::default(),
-        paths: Paths { firecracker: cli.firecracker, kernel: cli.kernel },
+        paths: Paths {
+            firecracker: cli.firecracker,
+            kernel: cli.kernel,
+        },
         init,
         state_dir: cli.state_dir,
     });
@@ -202,19 +255,43 @@ async fn main() -> Result<()> {
         Cmd::Image { reference } => {
             let t = Instant::now();
             let img = ctx.image(&reference, &BTreeMap::new(), "app")?;
-            println!("{} ({}) in {}", img.rootfs.display(), img.id, ms(t.elapsed()));
+            println!(
+                "{} ({}) in {}",
+                img.rootfs.display(),
+                img.id,
+                ms(t.elapsed())
+            );
         }
-        Cmd::Bench { image, port, runs, memory_mib, vcpus } => {
-            tokio::task::spawn_blocking(move || bench(&ctx, &image, port, runs, vcpus, memory_mib)).await??
+        Cmd::Bench {
+            image,
+            port,
+            runs,
+            memory_mib,
+            vcpus,
+        } => {
+            tokio::task::spawn_blocking(move || bench(&ctx, &image, port, runs, vcpus, memory_mib))
+                .await??
         }
         Cmd::Up { spec } => up(ctx, spec).await?,
-        Cmd::Agent { doc, status, trust, host_id, memory_mib } => {
+        Cmd::Agent {
+            doc,
+            status,
+            trust,
+            host_id,
+            memory_mib,
+            box_key,
+        } => {
+            std::fs::create_dir_all(&ctx.state_dir)?;
+            let box_key = proto::BoxKey::load_or_create(
+                &box_key.unwrap_or_else(|| ctx.state_dir.join("host-box.key")),
+            )?;
             let cfg = agent::Config {
                 doc: proto::Loc::parse(&doc)?,
                 status: proto::Loc::parse(&status)?,
                 trust: proto::Trust::load(&trust)?,
                 host_id,
                 memory_mib,
+                box_key,
             };
             agent::run(ctx, cfg).await?
         }
@@ -244,17 +321,30 @@ fn http_get(addr: SocketAddr, timeout: Duration) -> Result<(Duration, String)> {
         })();
         match attempt {
             Ok(body) => return Ok((start.elapsed(), body)),
-            Err(e) if start.elapsed() > timeout => return Err(e.context(format!("{addr} never answered"))),
+            Err(e) if start.elapsed() > timeout => {
+                return Err(e.context(format!("{addr} never answered")))
+            }
             Err(_) => std::thread::sleep(Duration::from_millis(2)),
         }
     }
 }
 
-fn bench(ctx: &Ctx, reference: &str, port: u16, runs: usize, vcpus: u8, memory_mib: u32) -> Result<()> {
+fn bench(
+    ctx: &Ctx,
+    reference: &str,
+    port: u16,
+    runs: usize,
+    vcpus: u8,
+    memory_mib: u32,
+) -> Result<()> {
     net::init_host()?;
     let t = Instant::now();
     let img = ctx.image(reference, &BTreeMap::new(), "bench")?;
-    log(format!("image ready in {} -> {}", ms(t.elapsed()), img.rootfs.display()));
+    log(format!(
+        "image ready in {} -> {}",
+        ms(t.elapsed()),
+        img.rootfs.display()
+    ));
     let mut vm = Vm::new("bench", 250, &ctx.state_dir, vcpus, memory_mib)?;
     let addr = SocketAddr::from((vm.slot.guest_ip(), port));
     let (mut cold, mut sleep, mut wake) = (vec![], vec![], vec![]);
@@ -281,7 +371,10 @@ fn bench(ctx: &Ctx, reference: &str, port: u16, runs: usize, vcpus: u8, memory_m
                 second.lines().next().unwrap_or("")
             ));
             if i == 0 {
-                log(format!("first response: {:?}", first.lines().next().unwrap_or("")));
+                log(format!(
+                    "first response: {:?}",
+                    first.lines().next().unwrap_or("")
+                ));
             }
             cold.push(c);
             sleep.push(s);
@@ -290,7 +383,9 @@ fn bench(ctx: &Ctx, reference: &str, port: u16, runs: usize, vcpus: u8, memory_m
         }
         Ok(())
     })();
-    let mem = std::fs::metadata(vm.dir.join("vm.mem")).map(|m| m.len()).unwrap_or(0);
+    let mem = std::fs::metadata(vm.dir.join("vm.mem"))
+        .map(|m| m.len())
+        .unwrap_or(0);
     let log_tail = std::fs::read_to_string(vm.log_path()).unwrap_or_default();
     let mut vm = vm;
     vm.destroy();
@@ -373,7 +468,9 @@ fn load_spec(path: &Path, last_good: &Path) -> Result<Spec> {
             Ok(spec)
         }
         Err(e) => {
-            let spec = serde_json::from_slice(&std::fs::read(last_good).context("no last-known-good spec")?)?;
+            let spec = serde_json::from_slice(
+                &std::fs::read(last_good).context("no last-known-good spec")?,
+            )?;
             log(format!("spec unusable ({e:#}); keeping last-known-good"));
             Ok(spec)
         }
@@ -394,7 +491,10 @@ async fn up(ctx: Arc<Ctx>, spec_path: PathBuf) -> Result<()> {
     let mut drains = tokio::task::JoinSet::new();
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     use tokio::signal::unix::{signal, SignalKind};
-    let (mut sigint, mut sigterm) = (signal(SignalKind::interrupt())?, signal(SignalKind::terminate())?);
+    let (mut sigint, mut sigterm) = (
+        signal(SignalKind::interrupt())?,
+        signal(SignalKind::terminate())?,
+    );
     loop {
         tokio::select! {
             _ = tick.tick() => {}
@@ -410,8 +510,16 @@ async fn up(ctx: Arc<Ctx>, spec_path: PathBuf) -> Result<()> {
                 continue;
             }
         };
-        let wanted: HashMap<_, _> = spec.services.iter().map(|s| (s.name.clone(), s.clone())).collect();
-        let gone: Vec<String> = running.keys().filter(|n| !wanted.contains_key(*n)).cloned().collect();
+        let wanted: HashMap<_, _> = spec
+            .services
+            .iter()
+            .map(|s| (s.name.clone(), s.clone()))
+            .collect();
+        let gone: Vec<String> = running
+            .keys()
+            .filter(|n| !wanted.contains_key(*n))
+            .cloned()
+            .collect();
         for name in gone {
             stop_service(&ctx, running.remove(&name).unwrap()).await;
             log(format!("{name}: removed"));
@@ -424,11 +532,15 @@ async fn up(ctx: Arc<Ctx>, spec_path: PathBuf) -> Result<()> {
             match running.get_mut(&name) {
                 Some(r) if r.spec == s => {}
                 Some(r) if r.spec.public_port == s.public_port => {
-                    log(format!("{name}: releasing {} (old instance keeps serving)", s.image));
+                    log(format!(
+                        "{name}: releasing {} (old instance keeps serving)",
+                        s.image
+                    ));
                     let t = Instant::now();
                     match boot_instance(&ctx, &s, ctx.gen_id(&s.name)).await {
                         Ok(new) => {
-                            let old = std::mem::replace(&mut *r.backend.write().unwrap(), new.clone());
+                            let old =
+                                std::mem::replace(&mut *r.backend.write().unwrap(), new.clone());
                             r.watch.abort();
                             r.watch = tokio::spawn(watchdog(ctx.clone(), new.clone()));
                             r.spec = s.clone();
@@ -440,10 +552,16 @@ async fn up(ctx: Arc<Ctx>, spec_path: PathBuf) -> Result<()> {
                                 s.drain_secs
                             ));
                             retired.push(old.clone());
-                            drains.spawn(drain(ctx.clone(), old, Duration::from_secs(s.drain_secs)));
+                            drains.spawn(drain(
+                                ctx.clone(),
+                                old,
+                                Duration::from_secs(s.drain_secs),
+                            ));
                         }
                         Err(e) => {
-                            log(format!("{name}: release failed, old instance keeps serving: {e:#}"));
+                            log(format!(
+                                "{name}: release failed, old instance keeps serving: {e:#}"
+                            ));
                             failed.insert(name, s);
                         }
                     }
@@ -484,11 +602,23 @@ async fn boot_instance(ctx: &Arc<Ctx>, spec: &ServiceSpec, id: String) -> Result
         move || -> Result<(Vm, PathBuf)> {
             let t = Instant::now();
             let img = ctx.image(&spec.image, &spec.env, &spec.name)?;
-            log(format!("{id}: image {} ready in {}", spec.image, ms(t.elapsed())));
+            log(format!(
+                "{id}: image {} ready in {}",
+                spec.image,
+                ms(t.elapsed())
+            ));
             let mut vm = Vm::new(&id, idx, &ctx.state_dir, spec.vcpus, spec.memory_mib)?;
+            if !spec.secret_env.is_empty() {
+                vm.secrets = serde_json::to_vec(&spec.secret_env)?;
+            }
             let t = Instant::now();
             let ready = vm.cold_boot(&ctx.paths, &img.rootfs).and_then(|_| {
-                wait_ready(&mut vm, spec.port, spec.health_path.as_deref(), Duration::from_secs(spec.ready_timeout_secs))
+                wait_ready(
+                    &mut vm,
+                    spec.port,
+                    spec.health_path.as_deref(),
+                    Duration::from_secs(spec.ready_timeout_secs),
+                )
             });
             if let Err(e) = ready {
                 let console = std::fs::read_to_string(vm.log_path()).unwrap_or_default();
@@ -521,11 +651,19 @@ async fn boot_instance(ctx: &Arc<Ctx>, spec: &ServiceSpec, id: String) -> Result
 async fn start_service(ctx: Arc<Ctx>, spec: ServiceSpec) -> Result<Running> {
     let listener = TcpListener::bind(("0.0.0.0", spec.public_port)).await?;
     let inst = boot_instance(&ctx, &spec, ctx.gen_id(&spec.name)).await?;
-    log(format!("{}: serving 0.0.0.0:{} -> {}", spec.name, spec.public_port, inst.id));
+    log(format!(
+        "{}: serving 0.0.0.0:{} -> {}",
+        spec.name, spec.public_port, inst.id
+    ));
     let backend: Backend = Arc::new(std::sync::RwLock::new(inst.clone()));
     let accept = tokio::spawn(accept_loop(ctx.clone(), backend.clone(), listener));
     let watch = tokio::spawn(watchdog(ctx, inst));
-    Ok(Running { spec, backend, accept, watch })
+    Ok(Running {
+        spec,
+        backend,
+        accept,
+        watch,
+    })
 }
 
 async fn stop_service(ctx: &Ctx, r: Running) {
@@ -544,13 +682,19 @@ async fn drain(ctx: Arc<Ctx>, old: Arc<Instance>, timeout: Duration) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let cut = old.active.load(Ordering::SeqCst);
-    log(format!("{}: drained in {} ({cut} connections cut); destroying", old.id, ms(t.elapsed())));
+    log(format!(
+        "{}: drained in {} ({cut} connections cut); destroying",
+        old.id,
+        ms(t.elapsed())
+    ));
     old.destroy(&ctx).await;
 }
 
 async fn accept_loop(ctx: Arc<Ctx>, backend: Backend, listener: TcpListener) {
     loop {
-        let Ok((mut client, _)) = listener.accept().await else { continue };
+        let Ok((mut client, _)) = listener.accept().await else {
+            continue;
+        };
         let inst = {
             let b = backend.read().unwrap();
             b.active.fetch_add(1, Ordering::SeqCst);
@@ -567,7 +711,10 @@ async fn accept_loop(ctx: Arc<Ctx>, backend: Backend, listener: TcpListener) {
             .await;
             if let Err(e) = res {
                 let benign = e.downcast_ref::<std::io::Error>().is_some_and(|e| {
-                    matches!(e.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset)
+                    matches!(
+                        e.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    )
                 });
                 if !benign {
                     log(format!("{}: proxy error: {e:#}", inst.id));
@@ -595,9 +742,19 @@ async fn ensure_awake(ctx: &Ctx, inst: &Instance) -> Result<SocketAddr> {
         } else {
             vm.cold_boot(&ctx.paths, &inst.rootfs)
         }?;
-        wait_ready(&mut vm, inst.spec.port, None, Duration::from_secs(inst.spec.ready_timeout_secs)).map(|_| ())
+        wait_ready(
+            &mut vm,
+            inst.spec.port,
+            None,
+            Duration::from_secs(inst.spec.ready_timeout_secs),
+        )
+        .map(|_| ())
     })?;
-    log(format!("{}: woke on request in {}", inst.id, ms(t.elapsed())));
+    log(format!(
+        "{}: woke on request in {}",
+        inst.id,
+        ms(t.elapsed())
+    ));
     Ok(addr)
 }
 
@@ -610,16 +767,24 @@ async fn watchdog(ctx: Arc<Ctx>, inst: Arc<Instance>) {
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let mut restart = false;
-        if let Some(path) = inst.spec.health_path.clone().filter(|_| last_probe.elapsed() >= every) {
+        if let Some(path) = inst
+            .spec
+            .health_path
+            .clone()
+            .filter(|_| last_probe.elapsed() >= every)
+        {
             last_probe = Instant::now();
             let target = {
                 let vm = inst.vm.lock().await;
-                vm.is_running().then(|| SocketAddr::from((vm.slot.guest_ip(), inst.spec.port)))
+                vm.is_running()
+                    .then(|| SocketAddr::from((vm.slot.guest_ip(), inst.spec.port)))
             };
             if let Some(addr) = target {
-                let ok = tokio::task::spawn_blocking(move || vm::probe(addr, Some(&path), Duration::from_secs(2)))
-                    .await
-                    .unwrap_or(false);
+                let ok = tokio::task::spawn_blocking(move || {
+                    vm::probe(addr, Some(&path), Duration::from_secs(2))
+                })
+                .await
+                .unwrap_or(false);
                 fails = if ok { 0 } else { fails + 1 };
                 if fails > 0 {
                     log(format!("{}: liveness check failed ({fails}/3)", inst.id));
@@ -639,9 +804,14 @@ async fn watchdog(ctx: Arc<Ctx>, inst: Arc<Instance>) {
         }
         if restart {
             fails = 0;
-            let (port, hp, to) = (inst.spec.port, inst.spec.health_path.clone(), Duration::from_secs(inst.spec.ready_timeout_secs));
+            let (port, hp, to) = (
+                inst.spec.port,
+                inst.spec.health_path.clone(),
+                Duration::from_secs(inst.spec.ready_timeout_secs),
+            );
             let res = tokio::task::block_in_place(|| {
-                vm.cold_boot(&ctx.paths, &inst.rootfs).and_then(|_| wait_ready(&mut vm, port, hp.as_deref(), to))
+                vm.cold_boot(&ctx.paths, &inst.rootfs)
+                    .and_then(|_| wait_ready(&mut vm, port, hp.as_deref(), to))
             });
             if let Err(e) = res {
                 log(format!("{}: restart failed: {e:#}", inst.id));
@@ -650,10 +820,19 @@ async fn watchdog(ctx: Arc<Ctx>, inst: Arc<Instance>) {
             continue;
         }
         let quiet = inst.last_activity.lock().unwrap().elapsed();
-        if !idle.is_zero() && vm.is_running() && inst.active.load(Ordering::SeqCst) == 0 && quiet > idle {
+        if !idle.is_zero()
+            && vm.is_running()
+            && inst.active.load(Ordering::SeqCst) == 0
+            && quiet > idle
+        {
             let t = Instant::now();
             match tokio::task::block_in_place(|| vm.sleep()) {
-                Ok(()) => log(format!("{}: idle {}s, snapshotted and stopped in {}", inst.id, quiet.as_secs(), ms(t.elapsed()))),
+                Ok(()) => log(format!(
+                    "{}: idle {}s, snapshotted and stopped in {}",
+                    inst.id,
+                    quiet.as_secs(),
+                    ms(t.elapsed())
+                )),
                 Err(e) => log(format!("{}: sleep failed: {e:#}", inst.id)),
             }
         }

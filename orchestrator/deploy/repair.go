@@ -47,11 +47,14 @@ func Repair(ctx workflow.Context, in RepairInput) (RepairResult, error) {
 			return RepairResult{}, err
 		}
 	}
-	type group struct{ deployment, image string }
+	type group struct {
+		deployment, image string
+		secrets           int
+	}
 	counts := map[group]int{}
 	var order []group
 	for _, l := range rep.Lost {
-		g := group{l.Deployment, l.Image}
+		g := group{l.Deployment, l.Image, l.Secrets}
 		if counts[g] == 0 {
 			order = append(order, g)
 		}
@@ -60,7 +63,7 @@ func Repair(ctx workflow.Context, in RepairInput) (RepairResult, error) {
 	var fresh []Instance
 	for _, g := range order {
 		var batch []Instance
-		req := PlaceRequest{ServiceID: in.ServiceID, DeploymentID: g.deployment, Image: g.image, Count: counts[g]}
+		req := PlaceRequest{ServiceID: in.ServiceID, DeploymentID: g.deployment, Image: g.image, Secrets: g.secrets, Count: counts[g]}
 		if err := workflow.ExecuteActivity(r.short, a.PlaceInstances, req).Get(ctx, &batch); err != nil {
 			return RepairResult{Active: rep.Healthy, Reason: "placement failed: " + err.Error()}, nil
 		}

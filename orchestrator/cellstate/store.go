@@ -82,7 +82,7 @@ func (s *Store) Put(ctx context.Context, key string, b []byte) error {
 // List returns the contents of every object under prefix, keyed by object name.
 func (s *Store) List(ctx context.Context, prefix string) (map[string][]byte, error) {
 	out := map[string][]byte{}
-	for o := range s.c.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{Prefix: prefix}) {
+	for o := range s.c.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
 		if o.Err != nil {
 			return nil, o.Err
 		}

@@ -107,6 +107,27 @@ The core design (components, multi-tenancy, zero-downtime releases, failure beha
 - No volumes, no metrics, no log shipping (the console log is at `/var/lib/ccloud/vms/<name>/console.log`), and no cross-host scheduler or control plane.
 - Cloud Hypervisor backend for long-lived services.
 
+### Secrets (`e2e/secrets.sh`)
+
+- `secretctl set -pub secrets.pub -service svc-web K=V ...` writes an immutable, numbered secret set to `secrets/<service>/<version>.sealed`, sealed (libsodium sealed box, X25519) to the cell secrets key. The CLI only needs the public key.
+- Each hostd generates its own X25519 key (`<state-dir>/host-box.key`, never leaves the host) and reports the public half in its status.
+- A deploy pins a secret version (`deploy -secrets N`, default latest). The worker (`-secrets-key`) opens the set in memory and re-seals it to the key of the host each instance lands on, as `sealed_env` in the signed host doc. Repairs keep the instance's version.
+- hostd opens it just before boot and hands it to the VM as a separate read-only drive; `microinit` adds it to the app's env. Secrets are never baked into the cached image rootfs; the drive file lives in the VM dir and goes away with the VM.
+- Changing secrets = new set version = new deploy (rolling, zero downtime). Rolling back to an older version is a deploy with `-secrets <old>`. A missing version fails fast and rolls back.
+
+Results on real VMs (Temporal Cloud, MinIO, 2 hostd, edge, curl every 10 ms):
+
+| Check | Result |
+|---|---|
+| App reads `DB_PASSWORD` | `db=hunter2-v1` |
+| Bucket objects containing the plaintext (incl. decoded signed payloads) | 0 of 7 |
+| Rotate v1 → v2 under load | 0 non-200 of 517; responses switch from v1 to v2 |
+| Deploy pinned to v1 again | `db=hunter2-v1` |
+| Deploy with a missing version | rolled back, v1 keeps serving |
+| Files on host disk containing the plaintext (images cache + after shutdown) | 0 |
+
+Gaps: the worker holds the cell secrets key directly (prod: a KMS); plaintext is in guest memory and therefore in sleep snapshots on host disk; no per-environment keys or access control yet.
+
 ### Reliability run (`e2e/chaos.sh`)
 
 Same real cell as `e2e/cell.sh`; breaks one component at a time under curl every 10 ms through the edge.

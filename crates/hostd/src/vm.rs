@@ -19,6 +19,8 @@ pub struct Vm {
     pub dir: PathBuf,
     pub vcpus: u8,
     pub memory_mib: u32,
+    /// JSON env map given to the guest as a read-only second drive (/dev/vdb); empty = none.
+    pub secrets: Vec<u8>,
     fc: Option<Firecracker>,
 }
 
@@ -28,7 +30,15 @@ impl Vm {
         std::fs::create_dir_all(&dir)?;
         let slot = Slot { idx };
         slot.create()?;
-        Ok(Self { name: name.into(), slot, dir, vcpus, memory_mib, fc: None })
+        Ok(Self {
+            name: name.into(),
+            slot,
+            dir,
+            vcpus,
+            memory_mib,
+            secrets: Vec::new(),
+            fc: None,
+        })
     }
 
     pub fn log_path(&self) -> PathBuf {
@@ -57,8 +67,30 @@ impl Vm {
         if !ok {
             bail!("copying rootfs failed");
         }
-        let fc = Firecracker::spawn(&paths.firecracker, &self.name, &self.sock(), &self.log_path())?;
+        let secrets = if self.secrets.is_empty() {
+            None
+        } else {
+            use std::os::unix::fs::OpenOptionsExt;
+            let p = self.dir.join("secrets.json");
+            let _ = std::fs::remove_file(&p);
+            let mut b = self.secrets.clone();
+            b.resize(b.len().div_ceil(512) * 512, 0);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&p)?
+                .write_all(&b)?;
+            Some(p)
+        };
+        let fc = Firecracker::spawn(
+            &paths.firecracker,
+            &self.name,
+            &self.sock(),
+            &self.log_path(),
+        )?;
         fc.boot(&BootConfig {
+            secrets,
             kernel: paths.kernel.clone(),
             boot_args: format!(
                 "console=ttyS0 reboot=k panic=1 pci=off quiet init=/sbin/microinit {}",
@@ -76,7 +108,9 @@ impl Vm {
 
     /// Pause, write a full snapshot (vCPU/device state + guest RAM), and free the host resources.
     pub fn sleep(&mut self) -> Result<()> {
-        let Some(fc) = self.fc.take() else { return Ok(()) };
+        let Some(fc) = self.fc.take() else {
+            return Ok(());
+        };
         let (snap, mem) = self.snap();
         let res = fc.snapshot(&snap, &mem);
         fc.kill();
@@ -93,7 +127,12 @@ impl Vm {
             return Ok(());
         }
         let (snap, mem) = self.snap();
-        let fc = Firecracker::spawn(&paths.firecracker, &self.name, &self.sock(), &self.log_path())?;
+        let fc = Firecracker::spawn(
+            &paths.firecracker,
+            &self.name,
+            &self.sock(),
+            &self.log_path(),
+        )?;
         if let Err(e) = fc.restore(&snap, &mem) {
             fc.kill();
             return Err(e);
@@ -124,12 +163,20 @@ impl Vm {
 }
 
 /// Startup/readiness gate: polls the health check, failing fast if the VM exits first.
-pub fn wait_ready(vm: &mut Vm, port: u16, health_path: Option<&str>, timeout: Duration) -> Result<Duration> {
+pub fn wait_ready(
+    vm: &mut Vm,
+    port: u16,
+    health_path: Option<&str>,
+    timeout: Duration,
+) -> Result<Duration> {
     let addr = SocketAddr::from((vm.slot.guest_ip(), port));
     let start = Instant::now();
     while start.elapsed() < timeout {
         if vm.crashed() {
-            bail!("VM exited during startup after {:?} (app exited or crashed)", start.elapsed());
+            bail!(
+                "VM exited during startup after {:?} (app exited or crashed)",
+                start.elapsed()
+            );
         }
         if probe(addr, health_path, Duration::from_millis(500)) {
             return Ok(start.elapsed());
@@ -141,11 +188,18 @@ pub fn wait_ready(vm: &mut Vm, port: u16, health_path: Option<&str>, timeout: Du
 
 /// TCP connect, or an HTTP GET that must answer 2xx/3xx when `path` is set.
 pub fn probe(addr: SocketAddr, path: Option<&str>, timeout: Duration) -> bool {
-    let Ok(mut s) = TcpStream::connect_timeout(&addr, timeout) else { return false };
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
     let Some(path) = path else { return true };
     let _ = s.set_read_timeout(Some(timeout));
     let _ = s.set_write_timeout(Some(timeout));
-    if write!(s, "GET {path} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n").is_err() {
+    if write!(
+        s,
+        "GET {path} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .is_err()
+    {
         return false;
     }
     let mut buf = [0u8; 12];
@@ -157,22 +211,45 @@ pub fn probe(addr: SocketAddr, path: Option<&str>, timeout: Duration) -> bool {
         }
     }
     let line = String::from_utf8_lossy(&buf[..n]);
-    line.starts_with("HTTP/") && matches!(line.split_whitespace().nth(1).and_then(|c| c.chars().next()), Some('2' | '3'))
+    line.starts_with("HTTP/")
+        && matches!(
+            line.split_whitespace()
+                .nth(1)
+                .and_then(|c| c.chars().next()),
+            Some('2' | '3')
+        )
 }
 
 /// Kill Firecracker processes left by a previous hostd (killed without cleanup) whose VM dirs live under
 /// `vms_dir`. Without this a restarted agent boots fresh copies and the old VMs run on unmanaged.
 pub fn reap_stale(vms_dir: &std::path::Path) {
     let prefix = vms_dir.to_string_lossy().into_owned();
-    let Ok(procs) = std::fs::read_dir("/proc") else { return };
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return;
+    };
     for p in procs.flatten() {
-        let Some(pid) = p.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
-        let Ok(cmd) = std::fs::read(p.path().join("cmdline")) else { continue };
-        let args: Vec<String> = cmd.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+        let Some(pid) = p.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Ok(cmd) = std::fs::read(p.path().join("cmdline")) else {
+            continue;
+        };
+        let args: Vec<String> = cmd
+            .split(|b| *b == 0)
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
         let is_fc = args.first().is_some_and(|a| a.ends_with("firecracker"));
-        if is_fc && args.windows(2).any(|w| w[0] == "--api-sock" && w[1].starts_with(&prefix)) {
-            crate::log(format!("killing stale firecracker pid {pid} from a previous agent"));
-            let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
+        if is_fc
+            && args
+                .windows(2)
+                .any(|w| w[0] == "--api-sock" && w[1].starts_with(&prefix))
+        {
+            crate::log(format!(
+                "killing stale firecracker pid {pid} from a previous agent"
+            ));
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
         }
     }
 }

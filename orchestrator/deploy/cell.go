@@ -34,7 +34,41 @@ type Cell struct {
 	Signer   *cellstate.Signer
 	Services map[string]ServiceConfig
 	Poll     time.Duration
-	mu       sync.Mutex
+	// SecretsKey opens stored secret sets so they can be re-sealed to the host that runs an instance.
+	SecretsKey *cellstate.BoxKey
+	mu         sync.Mutex
+}
+
+// sealSecrets opens secret set version of service with the cell key and seals it to host's box key.
+// The plaintext only exists in this process's memory.
+func (c *Cell) sealSecrets(ctx context.Context, service string, version int, host string) (string, error) {
+	if c.SecretsKey == nil {
+		return "", fmt.Errorf("%w: worker has no -secrets-key", ErrSecrets)
+	}
+	b, err := c.Store.Get(ctx, cellstate.SecretsKey(service, version))
+	if err != nil {
+		return "", err
+	}
+	if b == nil {
+		return "", fmt.Errorf("%w: secret set %s v%d does not exist", ErrSecrets, service, version)
+	}
+	env, err := c.SecretsKey.OpenEnv(string(b))
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrSecrets, err)
+	}
+	raw, err := c.Store.Get(ctx, cellstate.HostStatusKey(host))
+	if err != nil {
+		return "", err
+	}
+	var st hostStatus
+	if raw == nil || json.Unmarshal(raw, &st) != nil || st.BoxPub == "" {
+		return "", fmt.Errorf("host %s has not reported a box key", host)
+	}
+	pub, err := cellstate.ParseKey32(st.BoxPub)
+	if err != nil {
+		return "", fmt.Errorf("host %s box key: %w", host, err)
+	}
+	return cellstate.SealEnv(env, pub)
 }
 
 func NewCell(store *cellstate.Store, signer *cellstate.Signer, servicesPath string) (*Cell, error) {
@@ -179,6 +213,7 @@ func (c *Cell) Place(ctx context.Context, req PlaceRequest) ([]Instance, error) 
 			Deployment: req.DeploymentID,
 			Service:    req.ServiceID,
 			Image:      req.Image,
+			Secrets:    req.Secrets,
 		}
 	}
 	return out, nil
@@ -207,11 +242,19 @@ func (c *Cell) PublishHosts(ctx context.Context, ch HostChange) error {
 		if img == "" {
 			img = ch.Image
 		}
-		e := get(in.Host)
-		e.start = append(e.start, instanceSpec{
+		spec := instanceSpec{
 			ID: in.ID, Service: in.Service, Deployment: in.Deployment, Image: img, Port: cfg.Port,
 			MemoryMiB: cfg.MemoryMiB, Env: cfg.Env, Health: health{Path: cfg.HealthPath}, Desired: "running",
-		})
+		}
+		if in.Secrets > 0 {
+			sealed, err := c.sealSecrets(ctx, in.Service, in.Secrets, in.Host)
+			if err != nil {
+				return fmt.Errorf("secrets for %s: %w", in.ID, err)
+			}
+			spec.SealedEnv, spec.Secrets = sealed, in.Secrets
+		}
+		e := get(in.Host)
+		e.start = append(e.start, spec)
 	}
 	for _, in := range ch.Sleep {
 		get(in.Host).sleep[in.ID] = true
@@ -494,7 +537,7 @@ func (c *Cell) Lost(ctx context.Context, service string) (LostReport, error) {
 		}
 		for _, s := range docs[in.Host].Instances {
 			if s.ID == in.ID {
-				in.Image = s.Image
+				in.Image, in.Secrets = s.Image, s.Secrets
 			}
 		}
 		if in.Image == "" {

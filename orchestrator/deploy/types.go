@@ -12,6 +12,8 @@ type instanceSpec struct {
 	Port       int               `json:"port"`
 	MemoryMiB  int               `json:"memory_mib,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
+	SealedEnv  string            `json:"sealed_env,omitempty"`
+	Secrets    int               `json:"secrets_version,omitempty"`
 	Health     health            `json:"health"`
 	Desired    string            `json:"desired"`
 }
@@ -33,6 +35,7 @@ type instanceStatus struct {
 
 type hostStatus struct {
 	HostID         string           `json:"host_id"`
+	BoxPub         string           `json:"box_pub"`
 	ReportedAt     int64            `json:"reported_at"`
 	MemoryTotal    int              `json:"memory_mib_total"`
 	MemoryUsed     int              `json:"memory_mib_used"`

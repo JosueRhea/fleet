@@ -21,7 +21,15 @@ struct Run {
 fn mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str) {
     let _ = std::fs::create_dir_all(target);
     let (s, t, f, d) = (cstr(src), cstr(target), cstr(fstype), cstr(data));
-    let rc = unsafe { libc::mount(s.as_ptr(), t.as_ptr(), f.as_ptr(), flags, d.as_ptr() as *const _) };
+    let rc = unsafe {
+        libc::mount(
+            s.as_ptr(),
+            t.as_ptr(),
+            f.as_ptr(),
+            flags,
+            d.as_ptr() as *const _,
+        )
+    };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EBUSY) {
@@ -47,7 +55,11 @@ fn loopback_up() {
         if fd < 0 {
             return;
         }
-        let mut req = IfReq { name: [0; 16], flags: 0, _pad: [0; 22] };
+        let mut req = IfReq {
+            name: [0; 16],
+            flags: 0,
+            _pad: [0; 22],
+        };
         req.name[..2].copy_from_slice(b"lo");
         if libc::ioctl(fd, libc::SIOCGIFFLAGS as _, &mut req) == 0 {
             req.flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
@@ -114,6 +126,18 @@ fn main() {
             cmd.env(k, v);
         }
     }
+    // Secrets arrive on their own read-only drive (NUL-padded JSON), never in the image.
+    if let Ok(b) = std::fs::read("/dev/vdb") {
+        let end = b.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
+        match serde_json::from_slice::<std::collections::BTreeMap<String, String>>(&b[..end]) {
+            Ok(m) => {
+                for (k, v) in m {
+                    cmd.env(k, v);
+                }
+            }
+            Err(e) => eprintln!("microinit: bad secrets drive: {e}"),
+        }
+    }
     if !run.cwd.is_empty() {
         cmd.current_dir(&run.cwd);
     }
@@ -134,7 +158,10 @@ fn main() {
         let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
         if pid == main_pid {
             if libc::WIFEXITED(status) {
-                eprintln!("microinit: app exited with code {}", libc::WEXITSTATUS(status));
+                eprintln!(
+                    "microinit: app exited with code {}",
+                    libc::WEXITSTATUS(status)
+                );
             } else {
                 eprintln!("microinit: app killed by signal {}", libc::WTERMSIG(status));
             }

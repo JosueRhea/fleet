@@ -14,12 +14,14 @@ type Instance struct {
 	Deployment string `json:"deployment"`
 	Service    string `json:"service,omitempty"`
 	Image      string `json:"image,omitempty"`
+	Secrets    int    `json:"secrets,omitempty"` // secret set version; 0 = none
 }
 
 type PlaceRequest struct {
 	ServiceID    string
 	DeploymentID string
 	Image        string
+	Secrets      int
 	Count        int
 }
 
@@ -54,6 +56,9 @@ type LostReport struct {
 
 var ErrNotReady = errors.New("instances not ready")
 
+// ErrSecrets means a deployment's secret set can't be delivered (missing version, no key); retrying won't help.
+var ErrSecrets = errors.New("secrets unavailable")
+
 // ErrHostLost means an instance's host stopped reporting while it was booting; the deploy re-places it.
 var ErrHostLost = errors.New("host lost")
 
@@ -79,7 +84,11 @@ func (a *Activities) PlaceInstances(ctx context.Context, req PlaceRequest) ([]In
 }
 
 func (a *Activities) PublishHostChange(ctx context.Context, change HostChange) error {
-	return a.Cluster.PublishHosts(ctx, change)
+	err := a.Cluster.PublishHosts(ctx, change)
+	if errors.Is(err, ErrSecrets) {
+		return temporal.NewNonRetryableApplicationError(err.Error(), "Secrets", err)
+	}
+	return err
 }
 
 func (a *Activities) WaitReady(ctx context.Context, ins []Instance, timeout time.Duration) error {

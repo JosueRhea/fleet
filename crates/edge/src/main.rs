@@ -56,7 +56,10 @@ struct Stats {
 
 impl Stats {
     fn ejected(&self) -> bool {
-        self.ejected_until.lock().unwrap().is_some_and(|t| Instant::now() < t)
+        self.ejected_until
+            .lock()
+            .unwrap()
+            .is_some_and(|t| Instant::now() < t)
     }
     fn result(&self, ok: bool) {
         if ok {
@@ -90,18 +93,33 @@ struct Edge {
 type Body = BoxBody<Bytes, hyper::Error>;
 
 fn text(code: StatusCode, msg: &str) -> Response<Body> {
-    let body = Full::new(Bytes::from(format!("{msg}\n"))).map_err(|n: Infallible| match n {}).boxed();
+    let body = Full::new(Bytes::from(format!("{msg}\n")))
+        .map_err(|n: Infallible| match n {})
+        .boxed();
     Response::builder().status(code).body(body).unwrap()
 }
 
 fn log(msg: impl AsRef<str>) {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-    eprintln!("[{}.{:03}] {}", t.as_secs(), t.subsec_millis(), msg.as_ref());
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    eprintln!(
+        "[{}.{:03}] {}",
+        t.as_secs(),
+        t.subsec_millis(),
+        msg.as_ref()
+    );
 }
 
 impl Edge {
     fn stats(&self, b: &Backend) -> Arc<Stats> {
-        let s = self.stats.lock().unwrap().entry(b.instance.clone()).or_default().clone();
+        let s = self
+            .stats
+            .lock()
+            .unwrap()
+            .entry(b.instance.clone())
+            .or_default()
+            .clone();
         *s.deployment.lock().unwrap() = b.deployment.clone();
         s
     }
@@ -115,7 +133,11 @@ impl Edge {
             routes.remove(t);
         }
         self.applied.store(doc.version, Ordering::SeqCst);
-        log(format!("applied edge doc v{} ({} routes)", doc.version, routes.len()));
+        log(format!(
+            "applied edge doc v{} ({} routes)",
+            doc.version,
+            routes.len()
+        ));
     }
 
     /// Weighted round robin over active, non-ejected backends; never eject the last one.
@@ -125,9 +147,15 @@ impl Edge {
         let live: Vec<&Backend> = route
             .backends
             .iter()
-            .filter(|b| b.state == BackendState::Active && b.weight > 0 && !skip.contains(&b.instance))
+            .filter(|b| {
+                b.state == BackendState::Active && b.weight > 0 && !skip.contains(&b.instance)
+            })
             .collect();
-        let healthy: Vec<&Backend> = live.iter().copied().filter(|b| !self.stats(b).ejected()).collect();
+        let healthy: Vec<&Backend> = live
+            .iter()
+            .copied()
+            .filter(|b| !self.stats(b).ejected())
+            .collect();
         let pool = if healthy.is_empty() { live } else { healthy };
         let total: u32 = pool.iter().map(|b| b.weight).sum();
         if total == 0 {
@@ -162,17 +190,28 @@ impl Edge {
         let idempotent = matches!(parts.method, Method::GET | Method::HEAD | Method::OPTIONS);
         let mut tried = Vec::new();
         for _ in 0..3 {
-            let Some((b, stats)) = self.pick(&host, &tried) else { break };
+            let Some((b, stats)) = self.pick(&host, &tried) else {
+                break;
+            };
             tried.push(b.instance.clone());
             stats.requests.fetch_add(1, Ordering::Relaxed);
             stats.in_flight.fetch_add(1, Ordering::SeqCst);
             let guard = InFlight(stats.clone());
-            let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-            let mut up = Request::builder().method(parts.method.clone()).uri(format!("http://{}{pq}", b.addr));
+            let pq = parts
+                .uri
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/");
+            let mut up = Request::builder()
+                .method(parts.method.clone())
+                .uri(format!("http://{}{pq}", b.addr));
             for (k, v) in &parts.headers {
                 up = up.header(k, v);
             }
-            let up = up.header("x-ccloud-instance", &b.instance).body(Full::new(body.clone())).unwrap();
+            let up = up
+                .header("x-ccloud-instance", &b.instance)
+                .body(Full::new(body.clone()))
+                .unwrap();
             match self.client.request(up).await {
                 Ok(resp) => {
                     stats.result(!resp.status().is_server_error());
@@ -188,7 +227,11 @@ impl Edge {
                 Err(e) => {
                     stats.result(false);
                     let retry = e.is_connect() || idempotent;
-                    log(format!("{host}: {} failed ({e:?}){}", b.instance, if retry { ", retrying" } else { "" }));
+                    log(format!(
+                        "{host}: {} failed ({e:?}){}",
+                        b.instance,
+                        if retry { ", retrying" } else { "" }
+                    ));
                     if !retry {
                         return Ok(text(StatusCode::BAD_GATEWAY, "upstream error"));
                     }
@@ -213,7 +256,12 @@ impl Edge {
                 ejected: s.ejected(),
             })
             .collect();
-        proto::EdgeStatus { edge_id: String::new(), reported_at: 0, applied_version: self.applied.load(Ordering::SeqCst), backends }
+        proto::EdgeStatus {
+            edge_id: String::new(),
+            reported_at: 0,
+            applied_version: self.applied.load(Ordering::SeqCst),
+            backends,
+        }
     }
 }
 
@@ -229,9 +277,14 @@ async fn main() -> Result<()> {
         applied: AtomicU64::new(0),
         stats: Default::default(),
         rr: AtomicUsize::new(0),
-        client: Client::builder(TokioExecutor::new()).pool_idle_timeout(Duration::from_secs(5)).build(connector),
+        client: Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(Duration::from_secs(5))
+            .build(connector),
     });
-    let (doc_loc, status_loc) = (proto::Loc::parse(&cli.doc)?, proto::Loc::parse(&cli.status)?);
+    let (doc_loc, status_loc) = (
+        proto::Loc::parse(&cli.doc)?,
+        proto::Loc::parse(&cli.status)?,
+    );
     let trust = proto::Trust::load(&cli.trust)?;
     if let Some(doc) = proto::load_last_good::<EdgeDoc>(&last_good, &trust) {
         log("restoring last-known-good edge doc");
@@ -243,13 +296,23 @@ async fn main() -> Result<()> {
         async move {
             let mut last_err = String::new();
             loop {
-                match proto::load_newer::<EdgeDoc>(&doc_loc, &trust, &last_good, edge.applied.load(Ordering::SeqCst)).await {
+                match proto::load_newer::<EdgeDoc>(
+                    &doc_loc,
+                    &trust,
+                    &last_good,
+                    edge.applied.load(Ordering::SeqCst),
+                )
+                .await
+                {
                     Ok(Some(doc)) => edge.apply(doc),
                     Ok(None) => last_err.clear(),
                     Err(e) => {
                         let e = format!("{e:#}");
                         if e != last_err {
-                            log(format!("edge doc unusable ({e}); keeping v{}", edge.applied.load(Ordering::SeqCst)));
+                            log(format!(
+                                "edge doc unusable ({e}); keeping v{}",
+                                edge.applied.load(Ordering::SeqCst)
+                            ));
                             last_err = e;
                         }
                     }
@@ -270,7 +333,9 @@ async fn main() -> Result<()> {
         let edge = edge.clone();
         tokio::spawn(async move {
             let svc = hyper::service::service_fn(move |req| edge.clone().handle(req));
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(conn), svc).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(conn), svc)
+                .await;
         });
     }
 }

@@ -10,6 +10,7 @@ pub struct Config {
     pub trust: proto::Trust,
     pub host_id: String,
     pub memory_mib: u32,
+    pub box_key: proto::BoxKey,
 }
 
 struct Managed {
@@ -22,8 +23,12 @@ struct Managed {
     watch: Option<JoinHandle<()>>,
 }
 
-fn service_spec(i: &InstanceSpec) -> ServiceSpec {
-    ServiceSpec {
+fn service_spec(i: &InstanceSpec, key: &proto::BoxKey) -> Result<ServiceSpec> {
+    let secret_env = match &i.sealed_env {
+        Some(sealed) => key.unseal_env(sealed)?,
+        None => BTreeMap::new(),
+    };
+    Ok(ServiceSpec {
         name: i.id.clone(),
         image: i.image.clone(),
         port: i.port,
@@ -36,7 +41,8 @@ fn service_spec(i: &InstanceSpec) -> ServiceSpec {
         ready_timeout_secs: i.health.ready_timeout_secs,
         drain_secs: 0,
         liveness_secs: i.health.liveness_secs,
-    }
+        secret_env,
+    })
 }
 
 /// Instances are immutable; only `desired` may change. Removal only via tombstone.
@@ -73,7 +79,10 @@ pub async fn run(ctx: Arc<Ctx>, cfg: Config) -> Result<()> {
     let mut applied = 0;
     let mut wanted = BTreeMap::new();
     if let Some(doc) = proto::load_last_good::<HostDoc>(&last_good, &cfg.trust) {
-        log(format!("restoring last-known-good host doc v{}", doc.version));
+        log(format!(
+            "restoring last-known-good host doc v{}",
+            doc.version
+        ));
         applied = doc.version;
         merge(&mut wanted, doc);
     }
@@ -82,7 +91,10 @@ pub async fn run(ctx: Arc<Ctx>, cfg: Config) -> Result<()> {
     let (mut last_report, mut reported_at) = (None::<proto::HostStatus>, 0u64);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     use tokio::signal::unix::{signal, SignalKind};
-    let (mut sigint, mut sigterm) = (signal(SignalKind::interrupt())?, signal(SignalKind::terminate())?);
+    let (mut sigint, mut sigterm) = (
+        signal(SignalKind::interrupt())?,
+        signal(SignalKind::terminate())?,
+    );
     loop {
         tokio::select! {
             _ = tick.tick() => {}
@@ -91,7 +103,12 @@ pub async fn run(ctx: Arc<Ctx>, cfg: Config) -> Result<()> {
         }
         match proto::load_newer::<HostDoc>(&cfg.doc, &cfg.trust, &last_good, applied).await {
             Ok(Some(doc)) => {
-                log(format!("applied host doc v{} ({} instances, {} tombstones)", doc.version, doc.instances.len(), doc.tombstones.len()));
+                log(format!(
+                    "applied host doc v{} ({} instances, {} tombstones)",
+                    doc.version,
+                    doc.instances.len(),
+                    doc.tombstones.len()
+                ));
                 applied = doc.version;
                 merge(&mut wanted, doc);
                 last_err.clear();
@@ -105,22 +122,46 @@ pub async fn run(ctx: Arc<Ctx>, cfg: Config) -> Result<()> {
                 }
             }
         }
-        let gone: Vec<String> = managed.keys().filter(|id| !wanted.contains_key(*id)).cloned().collect();
+        let gone: Vec<String> = managed
+            .keys()
+            .filter(|id| !wanted.contains_key(*id))
+            .cloned()
+            .collect();
         for id in gone {
             teardown(&ctx, managed.remove(&id).unwrap()).await;
             log(format!("{id}: stopped (tombstoned)"));
         }
         for (id, spec) in &wanted {
             let m = managed.entry(id.clone()).or_insert_with(|| {
-                log(format!("{id}: booting {} (deployment {})", spec.image, spec.deployment));
-                let (ctx, s) = (ctx.clone(), service_spec(spec));
+                log(format!(
+                    "{id}: booting {} (deployment {})",
+                    spec.image, spec.deployment
+                ));
+                let s = match service_spec(spec, &cfg.box_key) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log(format!("{id}: {e:#}"));
+                        return Managed {
+                            spec: spec.clone(),
+                            state: InstanceState::Failed,
+                            error: Some(format!("{e:#}")),
+                            addr: None,
+                            boot: None,
+                            inst: None,
+                            watch: None,
+                        };
+                    }
+                };
+                let ctx = ctx.clone();
                 let iid = id.clone();
                 Managed {
                     spec: spec.clone(),
                     state: InstanceState::Booting,
                     error: None,
                     addr: None,
-                    boot: Some(tokio::spawn(async move { boot_instance(&ctx, &s, iid).await })),
+                    boot: Some(tokio::spawn(
+                        async move { boot_instance(&ctx, &s, iid).await },
+                    )),
                     inst: None,
                     watch: None,
                 }
@@ -133,11 +174,17 @@ pub async fn run(ctx: Arc<Ctx>, cfg: Config) -> Result<()> {
                         m.state = InstanceState::Ready;
                         m.watch = Some(tokio::spawn(watchdog(ctx.clone(), inst.clone())));
                         m.inst = Some(inst);
-                        log(format!("{id}: ready at {}", m.addr.as_deref().unwrap_or("?")));
+                        log(format!(
+                            "{id}: ready at {}",
+                            m.addr.as_deref().unwrap_or("?")
+                        ));
                     }
                     Ok(Err(e)) => {
                         m.state = InstanceState::Failed;
-                        log(format!("{id}: failed: {}", format!("{e:#}").lines().next().unwrap_or("")));
+                        log(format!(
+                            "{id}: failed: {}",
+                            format!("{e:#}").lines().next().unwrap_or("")
+                        ));
                         m.error = Some(format!("{e:#}"));
                     }
                     Err(e) => {
@@ -154,7 +201,10 @@ pub async fn run(ctx: Arc<Ctx>, cfg: Config) -> Result<()> {
                     match tokio::task::block_in_place(|| vm.sleep()) {
                         Ok(()) => {
                             m.state = InstanceState::Sleeping;
-                            log(format!("{id}: snapshotted and stopped in {}", ms(t.elapsed())));
+                            log(format!(
+                                "{id}: snapshotted and stopped in {}",
+                                ms(t.elapsed())
+                            ));
                         }
                         Err(e) => log(format!("{id}: sleep failed: {e:#}")),
                     }
@@ -162,9 +212,14 @@ pub async fn run(ctx: Arc<Ctx>, cfg: Config) -> Result<()> {
                 (Desired::Running, InstanceState::Sleeping) => {
                     let t = Instant::now();
                     let mut vm = inst.vm.lock().await;
-                    let (port, hp, to) = (m.spec.port, m.spec.health.path.clone(), Duration::from_secs(m.spec.health.ready_timeout_secs));
+                    let (port, hp, to) = (
+                        m.spec.port,
+                        m.spec.health.path.clone(),
+                        Duration::from_secs(m.spec.health.ready_timeout_secs),
+                    );
                     let res = tokio::task::block_in_place(|| {
-                        vm.wake(&ctx.paths).and_then(|_| wait_ready(&mut vm, port, hp.as_deref(), to))
+                        vm.wake(&ctx.paths)
+                            .and_then(|_| wait_ready(&mut vm, port, hp.as_deref(), to))
                     });
                     match res {
                         Ok(_) => {
@@ -189,7 +244,11 @@ pub async fn run(ctx: Arc<Ctx>, cfg: Config) -> Result<()> {
             })
             .collect();
         instances.sort_by(|a, b| a.id.cmp(&b.id));
-        let memory_mib_used = managed.values().filter(|m| m.state != InstanceState::Sleeping).map(|m| m.spec.memory_mib).sum();
+        let memory_mib_used = managed
+            .values()
+            .filter(|m| m.state != InstanceState::Sleeping)
+            .map(|m| m.spec.memory_mib)
+            .sum();
         let mut st = proto::HostStatus {
             host_id: cfg.host_id.clone(),
             reported_at,
@@ -197,10 +256,13 @@ pub async fn run(ctx: Arc<Ctx>, cfg: Config) -> Result<()> {
             memory_mib_used,
             applied_version: applied,
             instances,
+            box_pub: cfg.box_key.public_hex(),
         };
         // Report on change, and every 2 s so the scheduler knows this host is alive.
         let now = proto::unix_now();
-        let changed = last_report.as_ref().is_none_or(|l| l.applied_version != st.applied_version || l.instances != st.instances);
+        let changed = last_report
+            .as_ref()
+            .is_none_or(|l| l.applied_version != st.applied_version || l.instances != st.instances);
         if changed || now >= reported_at + 2 {
             st.reported_at = now;
             match cfg.status.put_json(&st).await {

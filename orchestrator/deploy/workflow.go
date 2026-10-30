@@ -39,6 +39,7 @@ type Input struct {
 	// and rolls back before touching any old instance if its error rate is too high.
 	CanaryPercent int
 	CanaryBake    time.Duration
+	Secrets       int // secret set version pinned by this deployment (0 = none)
 }
 
 func (in *Input) applyDefaults() {
@@ -109,7 +110,7 @@ func RollingDeploy(ctx workflow.Context, in Input) (Result, error) {
 		}
 		n := min(in.MaxSurge, in.Replicas-len(r.ready))
 		var batch []Instance
-		req := PlaceRequest{ServiceID: in.ServiceID, DeploymentID: in.DeploymentID, Image: in.Image, Count: n}
+		req := PlaceRequest{ServiceID: in.ServiceID, DeploymentID: in.DeploymentID, Image: in.Image, Secrets: in.Secrets, Count: n}
 		if err := workflow.ExecuteActivity(r.short, a.PlaceInstances, req).Get(ctx, &batch); err != nil {
 			return r.rollBack("placement failed: " + err.Error())
 		}
@@ -224,7 +225,7 @@ func (r *rollout) retire(old []Instance) error {
 // promotes it to a full-weight backend (retiring one old instance) or rolls back.
 func (r *rollout) canary() (Result, bool) {
 	var batch []Instance
-	req := PlaceRequest{ServiceID: r.in.ServiceID, DeploymentID: r.in.DeploymentID, Image: r.in.Image, Count: 1}
+	req := PlaceRequest{ServiceID: r.in.ServiceID, DeploymentID: r.in.DeploymentID, Image: r.in.Image, Secrets: r.in.Secrets, Count: 1}
 	fail := func(reason string) (Result, bool) {
 		res, _ := r.rollBack(reason)
 		return res, true

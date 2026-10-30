@@ -27,6 +27,7 @@ func main() {
 	services := flag.String("services", "/etc/ccloud/services.json", "service config")
 	key := flag.String("key", "/etc/ccloud/signing.key", "publisher ed25519 seed (hex)")
 	bake := flag.Duration("bake", 10*time.Second, "bake window")
+	secrets := flag.Int("secrets", -1, "secret set version to pin (-1 = latest, 0 = none)")
 	canary := flag.Int("canary", 0, "route this % of traffic to one new instance first (0 = no canary)")
 	canaryBake := flag.Duration("canary-bake", 30*time.Second, "how long the canary takes its share before promotion")
 	rollbackAfter := flag.Duration("rollback-after", 0, "send a rollback signal after this long (0 = never)")
@@ -56,6 +57,18 @@ func main() {
 
 	in := deploy.Input{ServiceID: *service, DeploymentID: *deployment, Image: *image, Replicas: *replicas, MaxSurge: *surge, Bake: *bake, CanaryPercent: *canary, CanaryBake: *canaryBake}
 	in.Old = old
+	if *secrets < 0 {
+		vs, err := store.SecretVersions(ctx, *service)
+		if err != nil {
+			log.Fatalf("secret versions: %v", err)
+		}
+		*secrets = 0
+		if len(vs) > 0 {
+			*secrets = vs[len(vs)-1]
+		}
+	}
+	in.Secrets = *secrets
+	log.Printf("secret set version %d", in.Secrets)
 	log.Printf("replacing %d running instance(s) of %s", len(old), *service)
 	opts := client.StartWorkflowOptions{ID: "deploy-" + *service, TaskQueue: deploy.TaskQueue, WorkflowExecutionErrorWhenAlreadyStarted: true}
 	run, err := c.ExecuteWorkflow(ctx, opts, deploy.RollingDeploy, in)

@@ -1,0 +1,54 @@
+#!/bin/bash
+# Secrets end to end: secretctl seals a set to the cell key; the worker re-seals it to the host that
+# runs each instance; hostd opens it right before boot. Checks the app sees it, no plaintext is in the
+# state bucket, and rotating (new version = new deploy) has no downtime.
+# Needs scripts/build.sh, docker, sudo, /dev/kvm, TEMPORAL_API_KEY and a minio binary (MINIO_BIN).
+set -u
+E=$(cd "$(dirname "$0")" && pwd); R=$E/../target/release; C=${CELL_DIR:-/tmp/secrets}
+export TEMPORAL_ADDRESS=us-west-2.aws.api.temporal.io:7233 TEMPORAL_NAMESPACE=ccloud-dev.nhipi
+export CCLOUD_S3_ENDPOINT=http://127.0.0.1:9100 CCLOUD_BUCKET=ccloud-secrets-$$ AWS_ACCESS_KEY_ID=ccloud AWS_SECRET_ACCESS_KEY=ccloud-dev-secret
+B=s3://$CCLOUD_BUCKET
+sudo rm -rf $C; mkdir -p $C/bin /tmp/minio-data; cd $C
+curl -sf -o /dev/null $CCLOUD_S3_ENDPOINT/minio/health/live || { MINIO_ROOT_USER=$AWS_ACCESS_KEY_ID MINIO_ROOT_PASSWORD=$AWS_SECRET_ACCESS_KEY setsid ${MINIO_BIN:-minio} server /tmp/minio-data --address 127.0.0.1:9100 >> minio.log 2>&1 & sleep 3; }
+docker build -q -t webapp:secret $E/app-secret >/dev/null
+(cd $E/../orchestrator && go build -o $C/bin/ ./cmd/worker ./cmd/deploy ./cmd/keygen ./cmd/statectl ./cmd/secretctl)
+bin/keygen -key signing.key -pub signing.pub; bin/secretctl keygen -key secrets.key -pub secrets.pub
+echo '{"svc-web":{"host":"web.local","port":8000,"health_path":"/health"}}' > services.json
+W="-services services.json -key signing.key"
+bin/worker $W -secrets-key secrets.key >> worker.log 2>&1 & WP=$!
+PE=--preserve-env=CCLOUD_S3_ENDPOINT,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY
+for h in host-a:1-100 host-b:101-200; do id=${h%%:*}
+  sudo $PE $R/hostd --state-dir $C/$id --slots ${h#*:} agent --host-id $id --memory-mib 1024 --trust signing.pub \
+    --doc $B/docs/hosts/$id.json --status $B/status/hosts/$id.json >> $id.log 2>&1 &
+done
+$R/edge --trust signing.pub --doc $B/docs/edge.json --status $B/status/edges/edge-1.json --state-dir $C/edge --listen 0.0.0.0:9000 >> edge.log 2>&1 & EP=$!
+sleep 5
+dep() { bin/deploy $W -service svc-web -image webapp:secret -replicas 2 -bake 3s "$@" 2>&1 | grep -E '"Status"|"Reason"|secret set|Fatal' | tr -s ' '; }
+get() { curl -s -m3 -H 'Host: web.local' localhost:9000/cgi-bin/app; }
+# Looks in raw objects and inside signed envelopes' base64 payloads.
+leaks() { n=0; for k in $(bin/statectl list ""); do
+    bin/statectl get $k | python3 -c "import sys,json,base64;b=sys.stdin.buffer.read();p=b
+try: p+=base64.b64decode(json.loads(b)['payload'])
+except Exception: pass
+sys.exit(0 if sys.argv[1].encode() in p else 1)" "$1" && { echo "    plaintext in $k"; n=$((n+1)); }; done
+  echo "  objects in the bucket containing \"$1\": $n of $(bin/statectl list "" | wc -l) (expect 0)"; }
+
+echo "== v1"; bin/secretctl set -pub secrets.pub -service svc-web DB_PASSWORD=hunter2-v1; dep
+echo "  app sees: $(get)"; leaks hunter2-v1
+echo "  host-a doc sealed_env present: $(bin/statectl get docs/hosts/host-a.json | python3 -c "import json,sys,base64;d=json.loads(base64.b64decode(json.load(sys.stdin)['payload']));print(all(i.get('sealed_env') for i in d['instances'] if i['desired']=='running'))")"
+
+echo "== rotate under load"; touch loadon
+(while [ -e loadon ]; do c=$(curl -s -m3 -H 'Host: web.local' -o body -w '%{http_code}' localhost:9000/cgi-bin/app || echo 000); echo "$(tr -d '\n' < body) $c"; sleep 0.01; done > codes) & LP=$!
+sleep 1; bin/secretctl set -pub secrets.pub -service svc-web DB_PASSWORD=hunter2-v2; dep
+sleep 1; rm loadon; wait $LP
+echo "  app sees: $(get)"; leaks hunter2-v2
+echo "  responses: $(awk '{print $1, $NF}' codes | sort | uniq -c | tr -s ' \n' ' ')"
+echo "  non-200: $(awk '$NF!=200' codes | wc -l) of $(wc -l < codes)"
+
+echo "== pinned old version (rollback to secrets v1)"; dep -secrets 1; echo "  app sees: $(get)"
+echo "== missing version (expect rolled_back, v1 keeps serving)"; dep -secrets 9; echo "  app sees: $(get)"
+
+echo "== host disk"; echo "  cached images containing a secret: $(sudo grep -rl hunter2 $C/host-a/images $C/host-b/images | wc -l) (expect 0)"
+echo "== shutdown"; sudo kill -INT $(pgrep -x hostd); kill $WP $EP; sleep 4
+echo "procs=$(pgrep -c -x firecracker) taps=$(ip -br link | grep -c '^mr') vmdirs=$(sudo ls $C/host-a/vms $C/host-b/vms 2>/dev/null | grep -vc ':$\|^$')"
+echo "  files on host disk containing a secret: $(sudo grep -rl hunter2 $C/host-a $C/host-b | wc -l) (expect 0)"

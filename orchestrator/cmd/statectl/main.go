@@ -2,10 +2,12 @@
 //
 //	statectl get docs/edge.json > edge.json
 //	statectl put docs/edge.json < edge.json
+//	statectl list status/
 package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -14,8 +16,8 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 3 || (os.Args[1] != "get" && os.Args[1] != "put") {
-		log.Fatal("usage: statectl get|put KEY")
+	if len(os.Args) != 3 || (os.Args[1] != "get" && os.Args[1] != "put" && os.Args[1] != "list") {
+		log.Fatal("usage: statectl get|put KEY | list PREFIX")
 	}
 	ctx := context.Background()
 	st, err := cellstate.OpenStore(ctx)
@@ -23,6 +25,16 @@ func main() {
 		log.Fatal(err)
 	}
 	key := os.Args[2]
+	if os.Args[1] == "list" {
+		objs, err := st.List(ctx, key)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for k := range objs {
+			fmt.Println(k)
+		}
+		return
+	}
 	if os.Args[1] == "get" {
 		b, err := st.Get(ctx, key)
 		if err != nil {

@@ -19,6 +19,7 @@ import (
 func main() {
 	services := flag.String("services", "/etc/ccloud/services.json", "service config")
 	key := flag.String("key", "/etc/ccloud/signing.key", "publisher ed25519 seed (hex)")
+	secretsKey := flag.String("secrets-key", "", "cell X25519 secrets key (hex); needed to deploy services with secrets")
 	flag.Parse()
 	store, signer, err := cellstate.OpenCell(context.Background(), *key)
 	if err != nil {
@@ -27,6 +28,11 @@ func main() {
 	cluster, err := deploy.NewCell(store, signer, *services)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if *secretsKey != "" {
+		if cluster.SecretsKey, err = cellstate.LoadBoxKey(*secretsKey); err != nil {
+			log.Fatal(err)
+		}
 	}
 	c, err := tclient.Dial()
 	if err != nil {
