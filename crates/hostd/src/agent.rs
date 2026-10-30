@@ -24,6 +24,9 @@ struct Managed {
 }
 
 fn service_spec(i: &InstanceSpec, key: &proto::BoxKey) -> Result<ServiceSpec> {
+    if let Some(f) = i.unsupported_feature() {
+        anyhow::bail!("instance requires {f:?}, which this hostd does not support (upgrade hostd)");
+    }
     let secret_env = match &i.sealed_env {
         Some(sealed) => key.unseal_env(sealed)?,
         None => BTreeMap::new(),

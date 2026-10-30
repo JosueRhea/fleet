@@ -49,13 +49,20 @@ func main() {
 	}
 }
 
-// watchHosts starts a Repair for any service routed to a host that stopped reporting. Repairs use
+// repairBackoff is the least time between two repairs of one service.
+const repairBackoff = 30 * time.Second
+
+// watchHosts starts a Repair for any service with lost instances (host stopped reporting, or
+// reports them failed). Repairs use
 // the deploy workflow ID, so a running deploy or repair for the service makes this a no-op.
 func watchHosts(c client.Client, cluster *deploy.Cell) {
 	ctx := context.Background()
 	// After the state bucket was unreachable every host looks stale until it reports again; that's
 	// not a host failure, so wait out StaleAfter before trusting staleness again.
 	var bucketErr time.Time
+	// A repair whose replacements also fail (an image that can't boot anywhere) would otherwise
+	// be restarted every tick, booting and stopping VMs in a loop.
+	lastRepair := map[string]time.Time{}
 	for range time.Tick(3 * time.Second) {
 		for svc := range cluster.Services {
 			rep, err := cluster.Lost(ctx, svc)
@@ -64,14 +71,15 @@ func watchHosts(c client.Client, cluster *deploy.Cell) {
 				log.Printf("%s: checking for lost instances: %v", svc, err)
 				continue
 			}
-			if len(rep.Lost) == 0 || time.Since(bucketErr) < deploy.StaleAfter {
+			if len(rep.Lost) == 0 || time.Since(bucketErr) < deploy.StaleAfter || time.Since(lastRepair[svc]) < repairBackoff {
 				continue
 			}
 			opts := client.StartWorkflowOptions{ID: "deploy-" + svc, TaskQueue: deploy.TaskQueue, WorkflowExecutionErrorWhenAlreadyStarted: true}
 			_, err = c.ExecuteWorkflow(ctx, opts, deploy.Repair, deploy.RepairInput{ServiceID: svc})
 			switch {
 			case err == nil:
-				log.Printf("%s: %d instance(s) on lost hosts, repair started", svc, len(rep.Lost))
+				lastRepair[svc] = time.Now()
+				log.Printf("%s: %d lost instance(s), repair started", svc, len(rep.Lost))
 			case !temporal.IsWorkflowExecutionAlreadyStartedError(err):
 				log.Printf("%s: starting repair: %v", svc, err)
 			}

@@ -17,11 +17,12 @@ echo '{"svc-web":{"host":"web.local","port":8000,"health_path":"/health"}}' > se
 W="-services services.json -key signing.key"
 bin/worker $W -secrets-key secrets.key >> worker.log 2>&1 & WP=$!
 PE=--preserve-env=CCLOUD_S3_ENDPOINT,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY
+host() { sudo $PE $R/hostd --state-dir $C/$1 --slots $2 agent --host-id $1 --memory-mib 1024 --trust signing.pub \
+  --doc $B/docs/hosts/$1.json --status $B/status/hosts/$1.json >> $1.log 2>&1 & }
 for h in host-a:1-100 host-b:101-200; do id=${h%%:*}
   # Register the box key read on the host itself (not from its unsigned status report).
   bin/hostctl add -key signing.key -id $id -box-pub $(sudo $R/hostd --state-dir $C/$id box-pub) >/dev/null
-  sudo $PE $R/hostd --state-dir $C/$id --slots ${h#*:} agent --host-id $id --memory-mib 1024 --trust signing.pub \
-    --doc $B/docs/hosts/$id.json --status $B/status/hosts/$id.json >> $id.log 2>&1 &
+  host $id ${h#*:}
 done
 $R/edge --trust signing.pub --doc $B/docs/edge.json --status $B/status/edges/edge-1.json --state-dir $C/edge --listen 0.0.0.0:9000 >> edge.log 2>&1 & EP=$!
 sleep 5
@@ -69,6 +70,16 @@ echo "  status reports with the redacted console line: $(grep -c 'password \*\*\
 echo "  plaintext in status reports: $(grep -c hunter2 crash-status), in deploy result: $(echo "$r" | grep -c hunter2) (expect 0, 0)"
 leaks hunter2-v1
 echo "  worker log lines containing a secret: $(grep -c hunter2 worker.log)"
+
+echo "== host-b's box key changes (state dir wiped); its instance can't be opened any more and is repaired elsewhere"
+sudo kill -9 $(pgrep -f "hostd --state-dir $C/host-b"); sudo rm -f $C/host-b/host-box.key; sleep 1; host host-b 101-200
+for i in $(seq 90); do
+  r=$(bin/statectl get docs/edge.json | python3 -c "import json,sys,base64;d=json.loads(base64.b64decode(json.load(sys.stdin)['payload']));print(' '.join(sorted(b['host'] for r in d['routes'] for b in r['backends'] if b['state']=='active')))")
+  [ "$r" = "host-a host-a" ] && break; sleep 1; done
+echo "  routes after ${i}s: $r (expect host-a host-a)"
+echo "  host-b reports: $(bin/statectl get status/hosts/host-b.json | grep -o 'cannot open sealed_env[^"]*' | head -1)"
+echo "  repairs started: $(grep -c 'repair started' worker.log)"
+echo "  app sees: $(get)"
 
 echo "== host disk"; echo "  cached images containing a secret: $(sudo grep -rl hunter2 $C/host-a/images $C/host-b/images | wc -l) (expect 0)"
 echo "== shutdown"; sudo kill -INT $(pgrep -x hostd); kill $WP $EP; sleep 4

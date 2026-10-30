@@ -13,6 +13,7 @@ type instanceSpec struct {
 	MemoryMiB  int               `json:"memory_mib,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
 	SealedEnv  string            `json:"sealed_env,omitempty"`
+	Requires   []string          `json:"requires,omitempty"` // hostd fails the instance if it lacks any of these
 	Secrets    int               `json:"secrets_version,omitempty"`
 	Health     health            `json:"health"`
 	Desired    string            `json:"desired"`

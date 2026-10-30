@@ -49,7 +49,8 @@ type HealthReport struct {
 	Requests  int64 // requests the error rate is over
 }
 
-// LostReport splits a service's routed instances by whether their host is still reporting.
+// LostReport splits a service's routed instances into healthy ones and lost ones: on a host that
+// stopped reporting, or reported failed by their host.
 type LostReport struct {
 	Healthy []Instance
 	Lost    []Instance // Image is filled in, so replacements run the same thing

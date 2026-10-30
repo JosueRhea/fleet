@@ -11,6 +11,11 @@ use std::time::Duration;
 
 pub const SCHEMA: u32 = 1;
 
+/// Instance features this hostd implements. A doc field that must not be silently ignored (an
+/// older hostd skipping `sealed_env` would boot the app without its secrets) is listed in the
+/// instance's `requires`; a hostd that lacks any of them fails the instance instead of booting it.
+pub const FEATURES: &[&str] = &["sealed_env"];
+
 pub trait Versioned {
     fn schema(&self) -> u32;
     fn version(&self) -> u64;
@@ -43,6 +48,9 @@ pub struct InstanceSpec {
     /// Secret env vars, sealed (libsodium sealed box) to this host's `box_pub`; only hostd can open it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealed_env: Option<String>,
+    /// Features this instance can't run correctly without (see `FEATURES`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
     #[serde(default)]
     pub health: Health,
     #[serde(default)]
@@ -506,6 +514,16 @@ fn to_hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+impl InstanceSpec {
+    /// The first required feature this hostd doesn't implement, if any.
+    pub fn unsupported_feature(&self) -> Option<&str> {
+        self.requires
+            .iter()
+            .map(String::as_str)
+            .find(|f| !FEATURES.contains(f))
+    }
+}
+
 #[cfg(test)]
 mod box_tests {
     use super::*;
@@ -528,5 +546,30 @@ mod box_tests {
         let b64 = B64.encode(ct);
         assert_eq!(k.unseal_env(&b64).unwrap()["DB_PASSWORD"], "s3cret");
         assert!(other.unseal_env(&b64).is_err());
+    }
+}
+
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+
+    fn spec(requires: &str) -> InstanceSpec {
+        serde_json::from_str(&format!(
+            r#"{{"id":"i","service":"s","deployment":"d","image":"x","port":80{requires}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn unknown_required_feature_is_reported() {
+        assert_eq!(spec("").unsupported_feature(), None);
+        assert_eq!(
+            spec(r#","requires":["sealed_env"]"#).unsupported_feature(),
+            None
+        );
+        assert_eq!(
+            spec(r#","requires":["sealed_env","vsock_secrets"]"#).unsupported_feature(),
+            Some("vsock_secrets")
+        );
     }
 }

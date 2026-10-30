@@ -299,7 +299,8 @@ func (c *Cell) PublishHosts(ctx context.Context, ch HostChange) error {
 			if err != nil {
 				return fmt.Errorf("secrets for %s: %w", in.ID, err)
 			}
-			spec.SealedEnv, spec.Secrets = sealed, in.Secrets
+			// An older hostd would ignore sealed_env and boot the app without its secrets.
+			spec.SealedEnv, spec.Secrets, spec.Requires = sealed, in.Secrets, []string{"sealed_env"}
 		}
 		e := get(in.Host)
 		e.start = append(e.start, spec)
@@ -583,7 +584,24 @@ func (c *Cell) Current(ctx context.Context, service string) ([]Instance, error) 
 	return out, nil
 }
 
-// Lost reports which routed instances of service sit on hosts that stopped reporting.
+// lost: the instance's host stopped reporting, or reports that the instance failed. A host only
+// reports a routed instance as failed when it could not boot it again (e.g. after a hostd restart,
+// or because it can no longer open the instance's secrets after its box key changed); instances
+// are immutable, so nothing on that host will fix it.
+func lost(hs map[string]hostStatus, in Instance) bool {
+	h, ok := hs[in.Host]
+	if !ok || !fresh(h.ReportedAt) {
+		return true
+	}
+	for _, s := range h.Instances {
+		if s.ID == in.ID {
+			return s.State == "failed"
+		}
+	}
+	return false
+}
+
+// Lost reports which routed instances of service are lost (see lost) and need replacing.
 func (c *Cell) Lost(ctx context.Context, service string) (LostReport, error) {
 	cur, err := c.Current(ctx, service)
 	if err != nil || len(cur) == 0 {
@@ -596,7 +614,7 @@ func (c *Cell) Lost(ctx context.Context, service string) (LostReport, error) {
 	var rep LostReport
 	docs := map[string]*hostDoc{}
 	for _, in := range cur {
-		if h, ok := hs[in.Host]; ok && fresh(h.ReportedAt) {
+		if !lost(hs, in) {
 			rep.Healthy = append(rep.Healthy, in)
 			continue
 		}

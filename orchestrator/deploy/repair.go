@@ -18,7 +18,7 @@ type RepairResult struct {
 	Reason   string // set when the replacements could not be brought up
 }
 
-// Repair replaces a service's instances on hosts that stopped reporting. It runs under the same
+// Repair replaces a service's lost instances: on hosts that stopped reporting, or reported failed. It runs under the same
 // workflow ID as deploys ("deploy-<service>"), so it never races a rollout.
 // Order: route around the lost instances, start replacements (same deployment and image) on live
 // hosts, gate on Ready, route to them, then tombstone the lost ones so a returning host stops them.
