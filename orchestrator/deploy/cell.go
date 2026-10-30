@@ -185,22 +185,54 @@ func (c *Cell) Place(ctx context.Context, req PlaceRequest) ([]Instance, error) 
 	if err != nil {
 		return nil, err
 	}
-	type cand struct {
-		id         string
-		free, mine int
-	}
-	var cands []*cand
+	var cands []*placeCand
 	for id, h := range hs {
 		rh, registered := reg.Hosts[id]
 		if !registered || !fresh(h.ReportedAt) || (req.Secrets > 0 && h.BoxPub != rh.BoxPub) {
 			continue
 		}
-		cands = append(cands, &cand{id: id, free: h.MemoryTotal - h.MemoryUsed})
+		// Count the deployment's instances already there: rolling deploys place one batch per
+		// call, and without this every batch would pick the same (emptiest) host.
+		mine := 0
+		for _, in := range h.Instances {
+			if in.Deployment == req.DeploymentID && in.State != "failed" {
+				mine++
+			}
+		}
+		cands = append(cands, &placeCand{id: id, free: h.MemoryTotal - h.MemoryUsed, mine: mine})
 	}
 	if len(cands) == 0 {
 		return nil, fmt.Errorf("no live registered hosts")
 	}
+	hosts, err := spread(cands, req.Count, cfg.MemoryMiB)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]Instance, req.Count)
+	for i, host := range hosts {
+		b := make([]byte, 3)
+		_, _ = rand.Read(b)
+		out[i] = Instance{
+			ID:         fmt.Sprintf("%s-%s", req.DeploymentID, hex.EncodeToString(b)),
+			Host:       host,
+			Deployment: req.DeploymentID,
+			Service:    req.ServiceID,
+			Image:      req.Image,
+			Secrets:    req.Secrets,
+		}
+	}
+	return out, nil
+}
+
+type placeCand struct {
+	id         string
+	free, mine int // free MiB; instances of the deployment being placed
+}
+
+// spread picks a host for each of n instances needing memMiB: fewest instances of the deployment
+// first, then most free memory, then host ID. It fails rather than overcommit.
+func spread(cands []*placeCand, n, memMiB int) ([]string, error) {
+	out := make([]string, n)
 	for i := range out {
 		sort.Slice(cands, func(a, b int) bool {
 			if cands[a].mine != cands[b].mine {
@@ -211,28 +243,19 @@ func (c *Cell) Place(ctx context.Context, req PlaceRequest) ([]Instance, error) 
 			}
 			return cands[a].id < cands[b].id
 		})
-		var pick *cand
+		var pick *placeCand
 		for _, h := range cands {
-			if h.free >= cfg.MemoryMiB {
+			if h.free >= memMiB {
 				pick = h
 				break
 			}
 		}
 		if pick == nil {
-			return nil, fmt.Errorf("no host has %d MiB free for instance %d/%d", cfg.MemoryMiB, i+1, req.Count)
+			return nil, fmt.Errorf("no host has %d MiB free for instance %d/%d", memMiB, i+1, n)
 		}
-		pick.free -= cfg.MemoryMiB
+		pick.free -= memMiB
 		pick.mine++
-		b := make([]byte, 3)
-		_, _ = rand.Read(b)
-		out[i] = Instance{
-			ID:         fmt.Sprintf("%s-%s", req.DeploymentID, hex.EncodeToString(b)),
-			Host:       pick.id,
-			Deployment: req.DeploymentID,
-			Service:    req.ServiceID,
-			Image:      req.Image,
-			Secrets:    req.Secrets,
-		}
+		out[i] = pick.id
 	}
 	return out, nil
 }
