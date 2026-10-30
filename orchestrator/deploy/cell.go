@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,11 +40,20 @@ type Cell struct {
 	mu         sync.Mutex
 }
 
-// sealSecrets opens secret set version of service with the cell key and seals it to host's box key.
-// The plaintext only exists in this process's memory.
-func (c *Cell) sealSecrets(ctx context.Context, service string, version int, host string) (string, error) {
+// sealSecrets opens secret set version of service with the cell key and seals it to host's
+// registered box key (never the one in its unsigned status report). The plaintext only exists in
+// this process's memory.
+func (c *Cell) sealSecrets(ctx context.Context, reg cellstate.HostRegistry, service string, version int, host string) (string, error) {
 	if c.SecretsKey == nil {
 		return "", fmt.Errorf("%w: worker has no -secrets-key", ErrSecrets)
+	}
+	rh, ok := reg.Hosts[host]
+	if !ok {
+		return "", fmt.Errorf("%w: host %s is not registered", ErrSecrets, host)
+	}
+	pub, err := cellstate.ParseKey32(rh.BoxPub)
+	if err != nil {
+		return "", fmt.Errorf("%w: host %s registered box key: %v", ErrSecrets, host, err)
 	}
 	b, err := c.Store.Get(ctx, cellstate.SecretsKey(service, version))
 	if err != nil {
@@ -55,18 +65,6 @@ func (c *Cell) sealSecrets(ctx context.Context, service string, version int, hos
 	env, err := c.SecretsKey.OpenEnv(string(b))
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrSecrets, err)
-	}
-	raw, err := c.Store.Get(ctx, cellstate.HostStatusKey(host))
-	if err != nil {
-		return "", err
-	}
-	var st hostStatus
-	if raw == nil || json.Unmarshal(raw, &st) != nil || st.BoxPub == "" {
-		return "", fmt.Errorf("host %s has not reported a box key", host)
-	}
-	pub, err := cellstate.ParseKey32(st.BoxPub)
-	if err != nil {
-		return "", fmt.Errorf("host %s box key: %w", host, err)
 	}
 	return cellstate.SealEnv(env, pub)
 }
@@ -131,13 +129,26 @@ func (c *Cell) hosts(ctx context.Context) (map[string]hostStatus, error) {
 	}
 	out := map[string]hostStatus{}
 	for k, b := range objs {
+		id, ok := strings.CutSuffix(strings.TrimPrefix(k, cellstate.HostStatusPrefix), ".json")
+		if !ok || strings.Contains(id, "/") {
+			continue // not a status report (List is recursive)
+		}
 		var st hostStatus
 		if err := json.Unmarshal(b, &st); err != nil {
 			return nil, fmt.Errorf("%s: %w", k, err)
 		}
-		out[st.HostID] = st
+		// Each host writes its own key; a report under one key that names another host is ignored
+		// (not an error, so one bad object can't stop every deploy and repair in the cell).
+		if st.HostID != id {
+			continue
+		}
+		out[id] = st
 	}
 	return out, nil
+}
+
+func (c *Cell) registry(ctx context.Context) (cellstate.HostRegistry, error) {
+	return cellstate.ReadRegistry(ctx, c.Store, c.Signer)
 }
 
 func (c *Cell) edges(ctx context.Context) ([]edgeStatus, error) {
@@ -158,8 +169,9 @@ func (c *Cell) edges(ctx context.Context) ([]edgeStatus, error) {
 	return out, nil
 }
 
-// Place spreads a deployment's instances across live hosts (fewest of this deployment first),
-// then by most free memory. It fails rather than overcommit.
+// Place spreads a deployment's instances across live registered hosts (fewest of this deployment
+// first), then by most free memory. It fails rather than overcommit. With secrets, a host only
+// qualifies if the box key it reports is the registered one, i.e. it can open what is sealed to it.
 func (c *Cell) Place(ctx context.Context, req PlaceRequest) ([]Instance, error) {
 	cfg, err := c.config(req.ServiceID)
 	if err != nil {
@@ -169,18 +181,24 @@ func (c *Cell) Place(ctx context.Context, req PlaceRequest) ([]Instance, error) 
 	if err != nil {
 		return nil, err
 	}
+	reg, err := c.registry(ctx)
+	if err != nil {
+		return nil, err
+	}
 	type cand struct {
 		id         string
 		free, mine int
 	}
 	var cands []*cand
 	for id, h := range hs {
-		if fresh(h.ReportedAt) {
-			cands = append(cands, &cand{id: id, free: h.MemoryTotal - h.MemoryUsed})
+		rh, registered := reg.Hosts[id]
+		if !registered || !fresh(h.ReportedAt) || (req.Secrets > 0 && h.BoxPub != rh.BoxPub) {
+			continue
 		}
+		cands = append(cands, &cand{id: id, free: h.MemoryTotal - h.MemoryUsed})
 	}
 	if len(cands) == 0 {
-		return nil, fmt.Errorf("no live hosts")
+		return nil, fmt.Errorf("no live registered hosts")
 	}
 	out := make([]Instance, req.Count)
 	for i := range out {
@@ -233,7 +251,14 @@ func (c *Cell) PublishHosts(ctx context.Context, ch HostChange) error {
 		}
 		return edits[host]
 	}
+	var reg cellstate.HostRegistry
 	for _, in := range ch.Start {
+		if in.Secrets > 0 && reg.Hosts == nil {
+			var err error
+			if reg, err = c.registry(ctx); err != nil {
+				return err
+			}
+		}
 		cfg, err := c.config(in.Service)
 		if err != nil {
 			return err
@@ -247,7 +272,7 @@ func (c *Cell) PublishHosts(ctx context.Context, ch HostChange) error {
 			MemoryMiB: cfg.MemoryMiB, Env: cfg.Env, Health: health{Path: cfg.HealthPath}, Desired: "running",
 		}
 		if in.Secrets > 0 {
-			sealed, err := c.sealSecrets(ctx, in.Service, in.Secrets, in.Host)
+			sealed, err := c.sealSecrets(ctx, reg, in.Service, in.Secrets, in.Host)
 			if err != nil {
 				return fmt.Errorf("secrets for %s: %w", in.ID, err)
 			}
@@ -485,7 +510,7 @@ func (c *Cell) Health(ctx context.Context, _, deploymentID string) (HealthReport
 	if req == 0 {
 		return HealthReport{}, nil
 	}
-	return HealthReport{ErrorRate: float64(errs) / float64(req)}, nil
+	return HealthReport{ErrorRate: float64(errs) / float64(req), Requests: req}, nil
 }
 
 // Current returns the instances the edge doc routes to for service: what a new deploy replaces.

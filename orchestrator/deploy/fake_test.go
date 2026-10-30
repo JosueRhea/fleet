@@ -16,7 +16,10 @@ type FakeCluster struct {
 	ErrorRate      float64
 	Logf           func(format string, args ...any)
 	LostReport     LostReport
-	LoseHostOnce   bool // the first WaitReady reports the batch's host as lost
+	LoseHostOnce   bool  // the first WaitReady reports the batch's host as lost
+	NoTraffic      bool  // Health reports 0 requests
+	Requests       int64 // requests Health reports (default 1000)
+	PlaceErr       error
 
 	mu      sync.Mutex
 	events  []string
@@ -42,6 +45,10 @@ func (f *FakeCluster) Events() []string {
 }
 
 func (f *FakeCluster) Place(_ context.Context, req PlaceRequest) ([]Instance, error) {
+	if f.PlaceErr != nil {
+		f.record("place failed")
+		return nil, f.PlaceErr
+	}
 	f.mu.Lock()
 	out := make([]Instance, req.Count)
 	for i := range out {
@@ -121,7 +128,14 @@ func (f *FakeCluster) WaitDrained(_ context.Context, ins []Instance, _ time.Dura
 }
 
 func (f *FakeCluster) Health(context.Context, string, string) (HealthReport, error) {
-	return HealthReport{ErrorRate: f.ErrorRate}, nil
+	if f.NoTraffic {
+		return HealthReport{}, nil
+	}
+	n := f.Requests
+	if n == 0 {
+		n = 1000
+	}
+	return HealthReport{ErrorRate: f.ErrorRate, Requests: n}, nil
 }
 
 func (f *FakeCluster) Lost(context.Context, string) (LostReport, error) {

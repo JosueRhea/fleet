@@ -105,12 +105,12 @@ func SecretsKey(service string, version int) string {
 
 // SecretVersions lists the stored secret set versions for service, ascending.
 func (s *Store) SecretVersions(ctx context.Context, service string) ([]int, error) {
-	objs, err := s.List(ctx, "secrets/"+service+"/")
+	keys, err := s.Keys(ctx, "secrets/"+service+"/")
 	if err != nil {
 		return nil, err
 	}
 	var out []int
-	for k := range objs {
+	for _, k := range keys {
 		base := strings.TrimSuffix(k[strings.LastIndex(k, "/")+1:], ".sealed")
 		if v, err := strconv.Atoi(base); err == nil {
 			out = append(out, v)

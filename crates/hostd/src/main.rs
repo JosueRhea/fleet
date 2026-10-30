@@ -71,6 +71,12 @@ enum Cmd {
         #[arg(long)]
         box_key: Option<PathBuf>,
     },
+    /// Print this host's X25519 public key (creating the key if missing), for `hostctl add -box-pub`.
+    BoxPub {
+        /// Same as `agent --box-key` (default: <state-dir>/host-box.key).
+        #[arg(long)]
+        box_key: Option<PathBuf>,
+    },
     /// Measure cold boot vs snapshot sleep/wake for one image.
     Bench {
         image: String,
@@ -273,6 +279,13 @@ async fn main() -> Result<()> {
                 .await??
         }
         Cmd::Up { spec } => up(ctx, spec).await?,
+        Cmd::BoxPub { box_key } => {
+            std::fs::create_dir_all(&ctx.state_dir)?;
+            let key = proto::BoxKey::load_or_create(
+                &box_key.unwrap_or_else(|| ctx.state_dir.join("host-box.key")),
+            )?;
+            println!("{}", key.public_hex());
+        }
         Cmd::Agent {
             doc,
             status,
@@ -420,6 +433,19 @@ fn tail(s: &str, n: usize) -> String {
     let s = s.find("Kernel panic").map_or(s, |i| &s[..i]);
     let lines: Vec<_> = s.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// Replaces every secret value in `s` with `***`, longest first so overlapping values are fully hidden.
+fn redact(s: &str, secrets: &BTreeMap<String, String>) -> String {
+    let mut values: Vec<&str> = secrets
+        .values()
+        .map(String::as_str)
+        .filter(|v| !v.is_empty())
+        .collect();
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    values
+        .iter()
+        .fold(s.to_string(), |s, v| s.replace(v, "***"))
 }
 
 // ---- `up`: desired-state reconciler, zero-downtime swaps, waking L4 proxy ----
@@ -623,7 +649,10 @@ async fn boot_instance(ctx: &Arc<Ctx>, spec: &ServiceSpec, id: String) -> Result
             if let Err(e) = ready {
                 let console = std::fs::read_to_string(vm.log_path()).unwrap_or_default();
                 vm.destroy();
-                bail!("{e:#}\n--- console ---\n{}", tail(&console, 15));
+                // This error goes into the host's status report and from there into the deploy's
+                // result, so an app that prints its config on a failed start must not leak secrets.
+                let console = redact(&tail(&console, 15), &spec.secret_env);
+                bail!("{e:#}\n--- console ---\n{console}");
             }
             log(format!("{id}: cold boot -> ready in {}", ms(t.elapsed())));
             Ok((vm, img.rootfs))
@@ -836,5 +865,24 @@ async fn watchdog(ctx: Arc<Ctx>, inst: Arc<Instance>) {
                 Err(e) => log(format!("{}: sleep failed: {e:#}", inst.id)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_hides_every_secret_value() {
+        let secrets = BTreeMap::from([
+            ("DB_URL".to_string(), "postgres://u:hunter2@db".to_string()),
+            ("DB_PASSWORD".to_string(), "hunter2".to_string()),
+            ("EMPTY".to_string(), String::new()),
+        ]);
+        let out = redact(
+            "connect postgres://u:hunter2@db failed\npassword hunter2 rejected",
+            &secrets,
+        );
+        assert_eq!(out, "connect *** failed\npassword *** rejected");
     }
 }

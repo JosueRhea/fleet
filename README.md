@@ -84,7 +84,7 @@ The test runs two hostd agents on one VM (`--slots 1-100` / `101-200`), with cur
 
 ```bash
 ./scripts/fetch-kernel.sh          # firecracker -> /usr/local/bin, kernel -> /var/lib/ccloud/vmlinux
-./scripts/build.sh                 # target/release/{hostd,microinit}
+./scripts/build.sh                 # target/release/{hostd,edge,microinit}
 docker build -t hello-node examples/hello-node
 sudo ./target/release/hostd bench public.ecr.aws/docker/library/nginx:alpine --port 80
 sudo ./target/release/hostd up examples/services.json
@@ -110,7 +110,8 @@ The core design (components, multi-tenancy, zero-downtime releases, failure beha
 ### Secrets (`e2e/secrets.sh`)
 
 - `secretctl set -pub secrets.pub -service svc-web K=V ...` writes an immutable, numbered secret set to `secrets/<service>/<version>.sealed`, sealed (libsodium sealed box, X25519) to the cell secrets key. The CLI only needs the public key.
-- Each hostd generates its own X25519 key (`<state-dir>/host-box.key`, never leaves the host) and reports the public half in its status.
+- Each hostd generates its own X25519 key (`<state-dir>/host-box.key`, never leaves the host). An operator registers it: `hostctl add -key signing.key -id host-a -box-pub $(hostd box-pub)`, run with the key read on the host itself. The registry (`docs/host-registry.json`) is signed by the publisher.
+- The worker only places instances on registered hosts and only seals secrets to the **registered** key. Status reports are unsigned and every agent can write them, so a key or host that only appears there gets nothing; a host whose reported key differs from its registered one gets no instances with secrets.
 - A deploy pins a secret version (`deploy -secrets N`, default latest). The worker (`-secrets-key`) opens the set in memory and re-seals it to the key of the host each instance lands on, as `sealed_env` in the signed host doc. Repairs keep the instance's version.
 - hostd opens it just before boot and hands it to the VM as a separate read-only drive; `microinit` adds it to the app's env. Secrets are never baked into the cached image rootfs; the drive file lives in the VM dir and goes away with the VM.
 - Changing secrets = new set version = new deploy (rolling, zero downtime). Rolling back to an older version is a deploy with `-secrets <old>`. A missing version fails fast and rolls back.
@@ -126,7 +127,7 @@ Results on real VMs (Temporal Cloud, MinIO, 2 hostd, edge, curl every 10 ms):
 | Deploy with a missing version | rolled back, v1 keeps serving |
 | Files on host disk containing the plaintext (images cache + after shutdown) | 0 |
 
-Gaps: the worker holds the cell secrets key directly (prod: a KMS); plaintext is in guest memory and therefore in sleep snapshots on host disk; no per-environment keys or access control yet.
+Gaps: the worker holds the cell secrets key directly (prod: a KMS); plaintext is in guest memory and therefore in sleep snapshots on host disk, and while a VM exists its secrets are also in a 0600 file in its VM dir (needed to restore it); the design in docs/architecture.md delivers them over vsock with nothing on disk. Status reports are still unsigned, so a party with bucket write access can make a host look dead (repair) or alive, but can no longer receive secrets or instances. A boot failure's console tail has secret values replaced by `***` before it is reported. No per-environment keys or access control yet.
 
 ### Reliability run (`e2e/chaos.sh`)
 

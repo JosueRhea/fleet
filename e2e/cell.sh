@@ -1,10 +1,10 @@
 #!/bin/bash
 # One cell, no shortcuts: worker (Temporal Cloud) publishes signed docs to an S3 bucket (MinIO);
 # two hostd agents and an edge pull them and report status there. Traffic goes through the edge.
-# Needs scripts/build.sh, docker, sudo, /dev/kvm, TEMPORAL_API_KEY and a minio binary (MINIO_BIN).
+# Needs scripts/build.sh, docker, sudo, /dev/kvm, TEMPORAL_API_KEY (or TEMPORAL_ADDRESS=localhost:7233 for a dev server) and a minio binary (MINIO_BIN).
 set -u
 E=$(cd "$(dirname "$0")" && pwd); R=$E/../target/release; C=${CELL_DIR:-/tmp/cell2}
-export TEMPORAL_ADDRESS=us-west-2.aws.api.temporal.io:7233 TEMPORAL_NAMESPACE=ccloud-dev.nhipi
+export TEMPORAL_ADDRESS=${TEMPORAL_ADDRESS:-us-west-2.aws.api.temporal.io:7233} TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-ccloud-dev.nhipi}
 export CCLOUD_S3_ENDPOINT=http://127.0.0.1:9100 CCLOUD_BUCKET=ccloud-e2e-$$ AWS_ACCESS_KEY_ID=ccloud AWS_SECRET_ACCESS_KEY=ccloud-dev-secret
 B=s3://$CCLOUD_BUCKET
 sudo rm -rf $C; mkdir -p $C/bin; cd $C
@@ -14,16 +14,18 @@ if ! curl -sf -o /dev/null $CCLOUD_S3_ENDPOINT/minio/health/live; then
   sleep 3
 fi
 for a in v1 v2 crash; do docker build -q -t webapp:$a $E/app-$a >/dev/null; done
-(cd $E/../orchestrator && go build -o $C/bin/ ./cmd/worker ./cmd/deploy ./cmd/keygen ./cmd/statectl)
+(cd $E/../orchestrator && go build -o $C/bin/ ./cmd/worker ./cmd/deploy ./cmd/keygen ./cmd/statectl ./cmd/hostctl)
 bin/keygen -key signing.key -pub signing.pub
 echo '{"svc-web":{"host":"web.local","port":8000,"health_path":"/health"}}' > services.json
 W="-services services.json -key signing.key"
 bin/worker $W > worker.log 2>&1 & WP=$!
 sleep 3   # worker creates the bucket
 PE=--preserve-env=CCLOUD_S3_ENDPOINT,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY
+# Register each host's box key, read on the host itself (not from its unsigned status report).
+reg() { bin/hostctl add -key signing.key -id $1 -box-pub $(sudo $R/hostd --state-dir $C/$1 box-pub) >/dev/null; }
 host() { sudo $PE $R/hostd --state-dir $C/$1 --slots $2 agent --host-id $1 --memory-mib 1024 --trust signing.pub \
   --doc $B/docs/hosts/$1.json --status $B/status/hosts/$1.json >> $1.log 2>&1 & }
-host host-a 1-100; host host-b 101-200
+reg host-a; reg host-b; host host-a 1-100; host host-b 101-200
 $R/edge --trust signing.pub --doc $B/docs/edge.json --status $B/status/edges/edge-1.json --state-dir $C/edge --listen 0.0.0.0:9000 > edge.log 2>&1 & EP=$!
 sleep 4
 load() { while [ -e $C/loadon ]; do p=$(cat $C/phase); r=$(curl -s -m3 -H 'Host: web.local' -w ' %{http_code}' localhost:9000/cgi-bin/app || echo " 000"); echo "$p $r"; sleep 0.01; done >> $C/codes; }
