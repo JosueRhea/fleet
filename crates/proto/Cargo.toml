@@ -6,5 +6,13 @@ description = "ccloud desired-state documents (host doc, edge doc) and status re
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
+ed25519-dalek = "2.2"
+rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls", "fail-on-err"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

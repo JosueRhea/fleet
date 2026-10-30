@@ -1,0 +1,456 @@
+package deploy
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/JosueRhea/fleet/orchestrator/cellstate"
+)
+
+// ServiceConfig is the per-service config the cell API will own.
+type ServiceConfig struct {
+	Host       string            `json:"host"` // edge hostname
+	Port       int               `json:"port"` // port the app listens on in the VM
+	HealthPath string            `json:"health_path,omitempty"`
+	MemoryMiB  int               `json:"memory_mib,omitempty"`
+	Env        map[string]string `json:"env,omitempty"`
+}
+
+// StaleAfter: a host or edge that has not reported for this long is treated as gone.
+const StaleAfter = 10 * time.Second
+
+// Cell is the Cluster for one cell: it is the publisher (signed host and edge docs in the state
+// bucket) and reads the status reports hostd agents and edges write to the same bucket.
+type Cell struct {
+	Store    *cellstate.Store
+	Signer   *cellstate.Signer
+	Services map[string]ServiceConfig
+	Poll     time.Duration
+	mu       sync.Mutex
+}
+
+func NewCell(store *cellstate.Store, signer *cellstate.Signer, servicesPath string) (*Cell, error) {
+	c := &Cell{Store: store, Signer: signer, Poll: 200 * time.Millisecond}
+	b, err := os.ReadFile(servicesPath)
+	if err != nil {
+		return nil, fmt.Errorf("service config: %w", err)
+	}
+	if err := json.Unmarshal(b, &c.Services); err != nil {
+		return nil, fmt.Errorf("service config: %w", err)
+	}
+	return c, nil
+}
+
+func (c *Cell) config(service string) (ServiceConfig, error) {
+	s, ok := c.Services[service]
+	if !ok {
+		return s, fmt.Errorf("unknown service %q", service)
+	}
+	if s.MemoryMiB == 0 {
+		s.MemoryMiB = 256
+	}
+	return s, nil
+}
+
+// readDoc loads the doc this publisher last wrote; a doc that fails verification is an error,
+// never a reason to start from empty.
+func (c *Cell) readDoc(ctx context.Context, key string, v any) error {
+	b, err := c.Store.Get(ctx, key)
+	if err != nil || b == nil {
+		return err
+	}
+	if err := c.Signer.Open(b, v); err != nil {
+		return fmt.Errorf("%s: %w", key, err)
+	}
+	return nil
+}
+
+func (c *Cell) writeDoc(ctx context.Context, key string, v any) error {
+	b, err := c.Signer.Seal(v)
+	if err != nil {
+		return err
+	}
+	return c.Store.Put(ctx, key, b)
+}
+
+// nextVersion is monotonic even if a doc is lost: consumers ignore versions <= what they applied.
+func nextVersion(prev int64) int64 {
+	return max(prev+1, time.Now().UnixMicro())
+}
+
+func fresh(reportedAt int64) bool {
+	return time.Since(time.Unix(reportedAt, 0)) <= StaleAfter
+}
+
+func (c *Cell) hosts(ctx context.Context) (map[string]hostStatus, error) {
+	objs, err := c.Store.List(ctx, cellstate.HostStatusPrefix)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]hostStatus{}
+	for k, b := range objs {
+		var st hostStatus
+		if err := json.Unmarshal(b, &st); err != nil {
+			return nil, fmt.Errorf("%s: %w", k, err)
+		}
+		out[st.HostID] = st
+	}
+	return out, nil
+}
+
+func (c *Cell) edges(ctx context.Context) ([]edgeStatus, error) {
+	objs, err := c.Store.List(ctx, cellstate.EdgeStatusPrefix)
+	if err != nil {
+		return nil, err
+	}
+	var out []edgeStatus
+	for k, b := range objs {
+		var st edgeStatus
+		if err := json.Unmarshal(b, &st); err != nil {
+			return nil, fmt.Errorf("%s: %w", k, err)
+		}
+		if fresh(st.ReportedAt) {
+			out = append(out, st)
+		}
+	}
+	return out, nil
+}
+
+// Place spreads a deployment's instances across live hosts (fewest of this deployment first),
+// then by most free memory. It fails rather than overcommit.
+func (c *Cell) Place(ctx context.Context, req PlaceRequest) ([]Instance, error) {
+	cfg, err := c.config(req.ServiceID)
+	if err != nil {
+		return nil, err
+	}
+	hs, err := c.hosts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	type cand struct {
+		id         string
+		free, mine int
+	}
+	var cands []*cand
+	for id, h := range hs {
+		if fresh(h.ReportedAt) {
+			cands = append(cands, &cand{id: id, free: h.MemoryTotal - h.MemoryUsed})
+		}
+	}
+	if len(cands) == 0 {
+		return nil, fmt.Errorf("no live hosts")
+	}
+	out := make([]Instance, req.Count)
+	for i := range out {
+		sort.Slice(cands, func(a, b int) bool {
+			if cands[a].mine != cands[b].mine {
+				return cands[a].mine < cands[b].mine
+			}
+			if cands[a].free != cands[b].free {
+				return cands[a].free > cands[b].free
+			}
+			return cands[a].id < cands[b].id
+		})
+		var pick *cand
+		for _, h := range cands {
+			if h.free >= cfg.MemoryMiB {
+				pick = h
+				break
+			}
+		}
+		if pick == nil {
+			return nil, fmt.Errorf("no host has %d MiB free for instance %d/%d", cfg.MemoryMiB, i+1, req.Count)
+		}
+		pick.free -= cfg.MemoryMiB
+		pick.mine++
+		b := make([]byte, 3)
+		_, _ = rand.Read(b)
+		out[i] = Instance{
+			ID:         fmt.Sprintf("%s-%s", req.DeploymentID, hex.EncodeToString(b)),
+			Host:       pick.id,
+			Deployment: req.DeploymentID,
+			Service:    req.ServiceID,
+			Image:      req.Image,
+		}
+	}
+	return out, nil
+}
+
+func (c *Cell) PublishHosts(ctx context.Context, ch HostChange) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	type edit struct {
+		start               []instanceSpec
+		sleep, wake, remove map[string]bool
+	}
+	edits := map[string]*edit{}
+	get := func(host string) *edit {
+		if edits[host] == nil {
+			edits[host] = &edit{sleep: map[string]bool{}, wake: map[string]bool{}, remove: map[string]bool{}}
+		}
+		return edits[host]
+	}
+	for _, in := range ch.Start {
+		cfg, err := c.config(in.Service)
+		if err != nil {
+			return err
+		}
+		img := in.Image
+		if img == "" {
+			img = ch.Image
+		}
+		e := get(in.Host)
+		e.start = append(e.start, instanceSpec{
+			ID: in.ID, Service: in.Service, Deployment: in.Deployment, Image: img, Port: cfg.Port,
+			MemoryMiB: cfg.MemoryMiB, Env: cfg.Env, Health: health{Path: cfg.HealthPath}, Desired: "running",
+		})
+	}
+	for _, in := range ch.Sleep {
+		get(in.Host).sleep[in.ID] = true
+	}
+	for _, in := range ch.Wake {
+		get(in.Host).wake[in.ID] = true
+	}
+	for _, in := range ch.Stop {
+		get(in.Host).remove[in.ID] = true
+	}
+	for host, e := range edits {
+		if host == "" {
+			return fmt.Errorf("instance without a host in host change")
+		}
+		key := cellstate.HostDocKey(host)
+		var doc hostDoc
+		if err := c.readDoc(ctx, key, &doc); err != nil {
+			return err
+		}
+		kept := []instanceSpec{}
+		for _, s := range doc.Instances {
+			switch {
+			case e.remove[s.ID]:
+				doc.Tombstones = append(doc.Tombstones, s.ID)
+				continue
+			case e.sleep[s.ID]:
+				s.Desired = "sleeping"
+			case e.wake[s.ID]:
+				s.Desired = "running"
+			}
+			kept = append(kept, s)
+		}
+		doc.Instances = append(kept, e.start...)
+		if len(doc.Tombstones) > 500 {
+			doc.Tombstones = doc.Tombstones[len(doc.Tombstones)-500:]
+		}
+		if doc.Tombstones == nil {
+			doc.Tombstones = []string{}
+		}
+		doc.Schema, doc.Version = 1, nextVersion(doc.Version)
+		if err := c.writeDoc(ctx, key, doc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Cell) poll(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(c.Poll):
+		return nil
+	}
+}
+
+func (c *Cell) instance(hs map[string]hostStatus, in Instance) instanceStatus {
+	for _, s := range hs[in.Host].Instances {
+		if s.ID == in.ID {
+			return s
+		}
+	}
+	return instanceStatus{}
+}
+
+// WaitReady passes once each instance's hostd reports it Ready (its readiness probe passed).
+func (c *Cell) WaitReady(ctx context.Context, ins []Instance, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		hs, err := c.hosts(ctx)
+		if err != nil {
+			return err
+		}
+		ready := 0
+		for _, in := range ins {
+			s := c.instance(hs, in)
+			if s.State == "failed" {
+				return fmt.Errorf("%w: %s on %s failed: %.300s", ErrNotReady, in.ID, in.Host, s.Error)
+			}
+			if h, ok := hs[in.Host]; ok && !fresh(h.ReportedAt) {
+				return fmt.Errorf("%w: host %s stopped reporting", ErrNotReady, in.Host)
+			}
+			if s.State == "ready" {
+				ready++
+			}
+		}
+		if ready == len(ins) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: %d/%d ready after %s", ErrNotReady, ready, len(ins), timeout)
+		}
+		if err := c.poll(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+func (c *Cell) PublishRoutes(ctx context.Context, u RouteUpdate) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cfg, err := c.config(u.ServiceID)
+	if err != nil {
+		return 0, err
+	}
+	hs, err := c.hosts(ctx)
+	if err != nil {
+		return 0, err
+	}
+	backends := []backend{}
+	add := func(ins []Instance, weight int, state string) error {
+		for _, in := range ins {
+			addr := c.instance(hs, in).Addr
+			if addr == "" {
+				return fmt.Errorf("no address reported for %s on %s", in.ID, in.Host)
+			}
+			backends = append(backends, backend{Instance: in.ID, Host: in.Host, Deployment: in.Deployment, Addr: addr, Weight: weight, State: state})
+		}
+		return nil
+	}
+	if err := add(u.Active, 100, "active"); err != nil {
+		return 0, err
+	}
+	if err := add(u.Draining, 0, "draining"); err != nil {
+		return 0, err
+	}
+	var doc edgeDoc
+	if err := c.readDoc(ctx, cellstate.EdgeDocKey, &doc); err != nil {
+		return 0, err
+	}
+	r := route{Host: cfg.Host, Service: u.ServiceID, Backends: backends}
+	replaced := false
+	for i := range doc.Routes {
+		if doc.Routes[i].Host == cfg.Host {
+			doc.Routes[i], replaced = r, true
+		}
+	}
+	if !replaced {
+		doc.Routes = append(doc.Routes, r)
+	}
+	doc.Schema, doc.Version = 1, nextVersion(doc.Version)
+	if doc.Tombstones == nil {
+		doc.Tombstones = []string{}
+	}
+	return doc.Version, c.writeDoc(ctx, cellstate.EdgeDocKey, doc)
+}
+
+// WaitEdgeAck passes once every live edge reports it is serving routes version >= version.
+func (c *Cell) WaitEdgeAck(ctx context.Context, version int64) error {
+	for {
+		es, err := c.edges(ctx)
+		if err != nil {
+			return err
+		}
+		acked := 0
+		for _, e := range es {
+			if e.AppliedVersion >= version {
+				acked++
+			}
+		}
+		if len(es) > 0 && acked == len(es) {
+			return nil
+		}
+		if err := c.poll(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+// WaitDrained waits for in-flight requests to these instances to reach zero on every edge.
+// On timeout it returns nil: the drain window is a bound, not a gate.
+func (c *Cell) WaitDrained(ctx context.Context, ins []Instance, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	want := map[string]bool{}
+	for _, in := range ins {
+		want[in.ID] = true
+	}
+	for {
+		es, err := c.edges(ctx)
+		if err != nil {
+			return err
+		}
+		var busy int64
+		for _, e := range es {
+			for _, b := range e.Backends {
+				if want[b.Instance] {
+					busy += b.InFlight
+				}
+			}
+		}
+		if busy == 0 || time.Now().After(deadline) {
+			return nil
+		}
+		if err := c.poll(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+// Health is the edge-observed error rate (5xx + upstream failures) of the deployment, all edges.
+func (c *Cell) Health(ctx context.Context, _, deploymentID string) (HealthReport, error) {
+	es, err := c.edges(ctx)
+	if err != nil {
+		return HealthReport{}, err
+	}
+	var req, errs int64
+	for _, e := range es {
+		for _, b := range e.Backends {
+			if b.Deployment == deploymentID {
+				req += b.Requests
+				errs += b.Errors
+			}
+		}
+	}
+	if req == 0 {
+		return HealthReport{}, nil
+	}
+	return HealthReport{ErrorRate: float64(errs) / float64(req)}, nil
+}
+
+// Current returns the instances the edge doc routes to for service: what a new deploy replaces.
+func (c *Cell) Current(ctx context.Context, service string) ([]Instance, error) {
+	cfg, err := c.config(service)
+	if err != nil {
+		return nil, err
+	}
+	var doc edgeDoc
+	if err := c.readDoc(ctx, cellstate.EdgeDocKey, &doc); err != nil {
+		return nil, err
+	}
+	var out []Instance
+	for _, r := range doc.Routes {
+		if r.Host != cfg.Host {
+			continue
+		}
+		for _, b := range r.Backends {
+			if b.State == "active" {
+				out = append(out, Instance{ID: b.Instance, Host: b.Host, Deployment: b.Deployment, Service: service})
+			}
+		}
+	}
+	return out, nil
+}

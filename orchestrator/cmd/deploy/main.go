@@ -11,6 +11,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/JosueRhea/fleet/orchestrator/cellstate"
 	"github.com/JosueRhea/fleet/orchestrator/deploy"
 	"github.com/JosueRhea/fleet/orchestrator/tclient"
 	"go.temporal.io/sdk/client"
@@ -22,18 +23,24 @@ func main() {
 	image := flag.String("image", "", "OCI image to deploy")
 	replicas := flag.Int("replicas", 2, "replicas")
 	surge := flag.Int("max-surge", 1, "max surge")
-	dir := flag.String("dir", "/var/lib/ccloud/cell", "cell state dir (services.json, edge.json)")
+	services := flag.String("services", "/etc/ccloud/services.json", "service config")
+	key := flag.String("key", "/etc/ccloud/signing.key", "publisher ed25519 seed (hex)")
 	bake := flag.Duration("bake", 10*time.Second, "bake window")
 	rollbackAfter := flag.Duration("rollback-after", 0, "send a rollback signal after this long (0 = never)")
 	flag.Parse()
+	ctx := context.Background()
 	if *image == "" {
 		log.Fatal("-image is required")
 	}
-	cluster, err := deploy.NewDocs(*dir, "")
+	store, signer, err := cellstate.OpenCell(ctx, *key)
 	if err != nil {
 		log.Fatal(err)
 	}
-	old, err := cluster.Current(*service)
+	cluster, err := deploy.NewCell(store, signer, *services)
+	if err != nil {
+		log.Fatal(err)
+	}
+	old, err := cluster.Current(ctx, *service)
 	if err != nil {
 		log.Fatalf("current instances: %v", err)
 	}
@@ -47,7 +54,6 @@ func main() {
 	in := deploy.Input{ServiceID: *service, DeploymentID: *deployment, Image: *image, Replicas: *replicas, MaxSurge: *surge, Bake: *bake}
 	in.Old = old
 	log.Printf("replacing %d running instance(s) of %s", len(old), *service)
-	ctx := context.Background()
 	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: "deploy-" + *service, TaskQueue: deploy.TaskQueue}, deploy.RollingDeploy, in)
 	if err != nil {
 		log.Fatalf("start deploy: %v", err)

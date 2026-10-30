@@ -1,20 +1,27 @@
-// Command worker runs the deploy workflow against the real hostd agent and edge proxy.
+// Command worker runs the deploy workflow for one cell: it publishes signed host/edge docs to the
+// state bucket and gates on the status reports hostd agents and edges write there.
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 
+	"github.com/JosueRhea/fleet/orchestrator/cellstate"
 	"github.com/JosueRhea/fleet/orchestrator/deploy"
 	"github.com/JosueRhea/fleet/orchestrator/tclient"
 	"go.temporal.io/sdk/worker"
 )
 
 func main() {
-	dir := flag.String("dir", "/var/lib/ccloud/cell", "desired-state docs, status reports and services.json")
-	host := flag.String("host", "local", "host ID instances are placed on")
+	services := flag.String("services", "/etc/ccloud/services.json", "service config")
+	key := flag.String("key", "/etc/ccloud/signing.key", "publisher ed25519 seed (hex)")
 	flag.Parse()
-	cluster, err := deploy.NewDocs(*dir, *host)
+	store, signer, err := cellstate.OpenCell(context.Background(), *key)
+	if err != nil {
+		log.Fatal(err)
+	}
+	cluster, err := deploy.NewCell(store, signer, *services)
 	if err != nil {
 		log.Fatal(err)
 	}
