@@ -6,16 +6,17 @@ mod vm;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use vm::{wait_tcp, Paths, Vm};
+use tokio::task::JoinHandle;
+use vm::{wait_ready, Paths, Vm};
 
 #[derive(Parser)]
 #[command(about = "ccloud host agent")]
@@ -75,6 +76,26 @@ struct ServiceSpec {
     /// Snapshot and stop the VM after this many idle seconds; 0 = never.
     #[serde(default)]
     idle_sleep_secs: u64,
+    /// HTTP path that must answer 2xx/3xx for readiness and liveness; plain TCP connect if unset.
+    #[serde(default)]
+    health_path: Option<String>,
+    #[serde(default = "default_ready_timeout")]
+    ready_timeout_secs: u64,
+    /// How long a replaced instance may keep finishing in-flight connections.
+    #[serde(default = "default_drain")]
+    drain_secs: u64,
+    #[serde(default = "default_liveness")]
+    liveness_secs: u64,
+}
+
+fn default_ready_timeout() -> u64 {
+    60
+}
+fn default_drain() -> u64 {
+    30
+}
+fn default_liveness() -> u64 {
+    5
 }
 
 fn default_vcpus() -> u8 {
@@ -88,9 +109,21 @@ struct Ctx {
     paths: Paths,
     init: PathBuf,
     state_dir: PathBuf,
+    slots: std::sync::Mutex<HashSet<u8>>,
+    next_gen: AtomicU64,
 }
 
 impl Ctx {
+    fn alloc_slot(&self) -> Result<u8> {
+        let mut used = self.slots.lock().unwrap();
+        let idx = (1..=249u8).find(|i| !used.contains(i)).context("out of VM slots")?;
+        used.insert(idx);
+        Ok(idx)
+    }
+    fn free_slot(&self, idx: u8) {
+        self.slots.lock().unwrap().remove(&idx);
+    }
+
     fn image(&self, reference: &str, env: &BTreeMap<String, String>, hostname: &str) -> Result<image::Image> {
         let env: Vec<_> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         image::prepare(reference, &env, hostname, &self.init, &self.state_dir.join("images"))
@@ -123,6 +156,8 @@ async fn main() -> Result<()> {
         bail!("guest kernel not found at {} (run scripts/fetch-kernel.sh)", cli.kernel.display());
     }
     let ctx = Arc::new(Ctx {
+        slots: Default::default(),
+        next_gen: Default::default(),
         paths: Paths { firecracker: cli.firecracker, kernel: cli.kernel },
         init,
         state_dir: cli.state_dir,
@@ -211,6 +246,7 @@ fn bench(ctx: &Ctx, reference: &str, port: u16, runs: usize, vcpus: u8, memory_m
     })();
     let mem = std::fs::metadata(vm.dir.join("vm.mem")).map(|m| m.len()).unwrap_or(0);
     let log_tail = std::fs::read_to_string(vm.log_path()).unwrap_or_default();
+    let mut vm = vm;
     vm.destroy();
     if let Err(e) = result {
         eprintln!("--- console ---\n{}", tail(&log_tail, 40));
@@ -243,19 +279,39 @@ fn tail(s: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-// ---- `up`: desired-state reconciler + waking L4 proxy ----
+// ---- `up`: desired-state reconciler, zero-downtime swaps, waking L4 proxy ----
 
-struct Service {
+/// One booted microVM serving one version of a service.
+struct Instance {
+    id: String,
     spec: ServiceSpec,
     vm: Mutex<Vm>,
     rootfs: PathBuf,
     active: AtomicUsize,
     last_activity: std::sync::Mutex<Instant>,
+    destroyed: AtomicBool,
 }
 
+impl Instance {
+    async fn destroy(&self, ctx: &Ctx) {
+        if self.destroyed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut vm = self.vm.lock().await;
+        let idx = vm.slot.idx;
+        tokio::task::block_in_place(|| vm.destroy());
+        ctx.free_slot(idx);
+    }
+}
+
+type Backend = Arc<std::sync::RwLock<Arc<Instance>>>;
+
+/// A service on this host: a stable public listener whose backend instance gets swapped on release.
 struct Running {
-    svc: Arc<Service>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    spec: ServiceSpec,
+    backend: Backend,
+    accept: JoinHandle<()>,
+    watch: JoinHandle<()>,
 }
 
 /// Read the spec; if it is missing or broken, fall back to the last spec that worked.
@@ -279,10 +335,14 @@ fn load_spec(path: &Path, last_good: &Path) -> Result<Spec> {
 async fn up(ctx: Arc<Ctx>, spec_path: PathBuf) -> Result<()> {
     net::init_host()?;
     net::remove_stale_taps();
+    let _ = std::fs::remove_dir_all(ctx.state_dir.join("vms"));
     std::fs::create_dir_all(&ctx.state_dir)?;
     let last_good = ctx.state_dir.join("last-good-spec.json");
     let mut running: HashMap<String, Running> = HashMap::new();
-    let mut last_applied: Option<Spec> = None;
+    // A spec that failed to deploy is not retried until it changes.
+    let mut failed: HashMap<String, ServiceSpec> = HashMap::new();
+    let mut retired: Vec<Arc<Instance>> = Vec::new();
+    let mut drains = tokio::task::JoinSet::new();
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     use tokio::signal::unix::{signal, SignalKind};
     let (mut sigint, mut sigterm) = (signal(SignalKind::interrupt())?, signal(SignalKind::terminate())?);
@@ -292,6 +352,8 @@ async fn up(ctx: Arc<Ctx>, spec_path: PathBuf) -> Result<()> {
             _ = sigint.recv() => break,
             _ = sigterm.recv() => break,
         }
+        while drains.try_join_next().is_some() {}
+        retired.retain(|i| !i.destroyed.load(Ordering::SeqCst));
         let spec = match load_spec(&spec_path, &last_good) {
             Ok(s) => s,
             Err(e) => {
@@ -299,115 +361,182 @@ async fn up(ctx: Arc<Ctx>, spec_path: PathBuf) -> Result<()> {
                 continue;
             }
         };
-        if last_applied.as_ref() == Some(&spec) {
-            continue;
-        }
         let wanted: HashMap<_, _> = spec.services.iter().map(|s| (s.name.clone(), s.clone())).collect();
-        let stale: Vec<String> = running
-            .iter()
-            .filter(|(name, r)| wanted.get(*name) != Some(&r.svc.spec))
-            .map(|(n, _)| n.clone())
-            .collect();
-        for name in stale {
-            stop(running.remove(&name).unwrap()).await;
-            log(format!("{name}: stopped"));
+        let gone: Vec<String> = running.keys().filter(|n| !wanted.contains_key(*n)).cloned().collect();
+        for name in gone {
+            stop_service(&ctx, running.remove(&name).unwrap()).await;
+            log(format!("{name}: removed"));
         }
+        failed.retain(|n, s| wanted.get(n) == Some(s));
         for (name, s) in wanted {
-            if running.contains_key(&name) {
+            if failed.get(&name) == Some(&s) {
                 continue;
             }
-            let used: Vec<u8> = running.values().map(|r| r.svc.vm.try_lock().map(|v| v.slot.idx).unwrap_or(0)).collect();
-            let idx = (1..=249u8).find(|i| !used.contains(i)).context("out of VM slots")?;
-            match start(ctx.clone(), s, idx).await {
-                Ok(r) => {
-                    running.insert(name, r);
+            match running.get_mut(&name) {
+                Some(r) if r.spec == s => {}
+                Some(r) if r.spec.public_port == s.public_port => {
+                    log(format!("{name}: releasing {} (old instance keeps serving)", s.image));
+                    let t = Instant::now();
+                    match boot_instance(&ctx, &s).await {
+                        Ok(new) => {
+                            let old = std::mem::replace(&mut *r.backend.write().unwrap(), new.clone());
+                            r.watch.abort();
+                            r.watch = tokio::spawn(watchdog(ctx.clone(), new.clone()));
+                            r.spec = s.clone();
+                            log(format!(
+                                "{name}: traffic switched {} -> {} after {}; draining old (up to {}s)",
+                                old.id,
+                                new.id,
+                                ms(t.elapsed()),
+                                s.drain_secs
+                            ));
+                            retired.push(old.clone());
+                            drains.spawn(drain(ctx.clone(), old, Duration::from_secs(s.drain_secs)));
+                        }
+                        Err(e) => {
+                            log(format!("{name}: release failed, old instance keeps serving: {e:#}"));
+                            failed.insert(name, s);
+                        }
+                    }
                 }
-                Err(e) => log(format!("{name}: deploy failed: {e:#}")),
+                _ => {
+                    if let Some(r) = running.remove(&name) {
+                        stop_service(&ctx, r).await;
+                    }
+                    match start_service(ctx.clone(), s.clone()).await {
+                        Ok(r) => {
+                            running.insert(name, r);
+                        }
+                        Err(e) => {
+                            log(format!("{name}: deploy failed: {e:#}"));
+                            failed.insert(name, s);
+                        }
+                    }
+                }
             }
         }
-        last_applied = Some(spec);
     }
     log("shutting down");
+    drains.shutdown().await;
     for (_, r) in running.drain() {
-        stop(r).await;
+        stop_service(&ctx, r).await;
+    }
+    for i in retired {
+        i.destroy(&ctx).await;
     }
     Ok(())
 }
 
-async fn stop(r: Running) {
-    for t in &r.tasks {
-        t.abort();
-    }
-    for t in r.tasks {
-        let _ = t.await;
-    }
-    if let Ok(svc) = Arc::try_unwrap(r.svc) {
-        let vm = svc.vm.into_inner();
-        tokio::task::spawn_blocking(move || vm.destroy()).await.ok();
-    }
-}
-
-async fn start(ctx: Arc<Ctx>, spec: ServiceSpec, idx: u8) -> Result<Running> {
-    let name = spec.name.clone();
-    let listener = TcpListener::bind(("0.0.0.0", spec.public_port)).await?;
-    let (vm, rootfs) = tokio::task::spawn_blocking({
-        let (ctx, spec) = (ctx.clone(), spec.clone());
+/// Boot a new instance and return it only once it passes its readiness check.
+async fn boot_instance(ctx: &Arc<Ctx>, spec: &ServiceSpec) -> Result<Arc<Instance>> {
+    let idx = ctx.alloc_slot()?;
+    let id = format!("{}-{}", spec.name, ctx.next_gen.fetch_add(1, Ordering::SeqCst));
+    let booted = tokio::task::spawn_blocking({
+        let (ctx, spec, id) = (ctx.clone(), spec.clone(), id.clone());
         move || -> Result<(Vm, PathBuf)> {
             let t = Instant::now();
             let img = ctx.image(&spec.image, &spec.env, &spec.name)?;
-            log(format!("{}: image {} ready in {}", spec.name, spec.image, ms(t.elapsed())));
-            let mut vm = Vm::new(&spec.name, idx, &ctx.state_dir, spec.vcpus, spec.memory_mib)?;
+            log(format!("{id}: image {} ready in {}", spec.image, ms(t.elapsed())));
+            let mut vm = Vm::new(&id, idx, &ctx.state_dir, spec.vcpus, spec.memory_mib)?;
             let t = Instant::now();
-            vm.cold_boot(&ctx.paths, &img.rootfs)?;
-            let addr = SocketAddr::from((vm.slot.guest_ip(), spec.port));
-            if let Err(e) = wait_tcp(addr, Duration::from_secs(60)) {
+            let ready = vm.cold_boot(&ctx.paths, &img.rootfs).and_then(|_| {
+                wait_ready(&mut vm, spec.port, spec.health_path.as_deref(), Duration::from_secs(spec.ready_timeout_secs))
+            });
+            if let Err(e) = ready {
                 let console = std::fs::read_to_string(vm.log_path()).unwrap_or_default();
                 vm.destroy();
-                bail!("{e:#}\n--- console ---\n{}", tail(&console, 30));
+                bail!("{e:#}\n--- console ---\n{}", tail(&console, 15));
             }
-            log(format!("{}: cold boot -> listening on {addr} in {}", spec.name, ms(t.elapsed())));
+            log(format!("{id}: cold boot -> ready in {}", ms(t.elapsed())));
             Ok((vm, img.rootfs))
         }
     })
-    .await??;
-    log(format!("{name}: serving 0.0.0.0:{} -> {}:{}", spec.public_port, vm.slot.guest_ip(), spec.port));
-    let svc = Arc::new(Service {
-        spec,
+    .await?;
+    let (vm, rootfs) = match booted {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.free_slot(idx);
+            return Err(e);
+        }
+    };
+    Ok(Arc::new(Instance {
+        id,
+        spec: spec.clone(),
         vm: Mutex::new(vm),
         rootfs,
         active: AtomicUsize::new(0),
         last_activity: std::sync::Mutex::new(Instant::now()),
-    });
-    let accept = tokio::spawn(accept_loop(ctx.clone(), svc.clone(), listener));
-    let watch = tokio::spawn(watchdog(ctx, svc.clone()));
-    Ok(Running { svc, tasks: vec![accept, watch] })
+        destroyed: AtomicBool::new(false),
+    }))
 }
 
-async fn accept_loop(ctx: Arc<Ctx>, svc: Arc<Service>, listener: TcpListener) {
+async fn start_service(ctx: Arc<Ctx>, spec: ServiceSpec) -> Result<Running> {
+    let listener = TcpListener::bind(("0.0.0.0", spec.public_port)).await?;
+    let inst = boot_instance(&ctx, &spec).await?;
+    log(format!("{}: serving 0.0.0.0:{} -> {}", spec.name, spec.public_port, inst.id));
+    let backend: Backend = Arc::new(std::sync::RwLock::new(inst.clone()));
+    let accept = tokio::spawn(accept_loop(ctx.clone(), backend.clone(), listener));
+    let watch = tokio::spawn(watchdog(ctx, inst));
+    Ok(Running { spec, backend, accept, watch })
+}
+
+async fn stop_service(ctx: &Ctx, r: Running) {
+    r.accept.abort();
+    r.watch.abort();
+    let _ = r.accept.await;
+    let _ = r.watch.await;
+    let inst = r.backend.read().unwrap().clone();
+    inst.destroy(ctx).await;
+}
+
+/// Let a replaced instance finish its in-flight connections, then destroy it.
+async fn drain(ctx: Arc<Ctx>, old: Arc<Instance>, timeout: Duration) {
+    let t = Instant::now();
+    while old.active.load(Ordering::SeqCst) > 0 && t.elapsed() < timeout {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let cut = old.active.load(Ordering::SeqCst);
+    log(format!("{}: drained in {} ({cut} connections cut); destroying", old.id, ms(t.elapsed())));
+    old.destroy(&ctx).await;
+}
+
+async fn accept_loop(ctx: Arc<Ctx>, backend: Backend, listener: TcpListener) {
     loop {
         let Ok((mut client, _)) = listener.accept().await else { continue };
-        let (ctx, svc) = (ctx.clone(), svc.clone());
+        let inst = {
+            let b = backend.read().unwrap();
+            b.active.fetch_add(1, Ordering::SeqCst);
+            b.clone()
+        };
+        let ctx = ctx.clone();
         tokio::spawn(async move {
-            svc.active.fetch_add(1, Ordering::SeqCst);
             let res = async {
-                let guest = ensure_awake(&ctx, &svc).await?;
+                let guest = ensure_awake(&ctx, &inst).await?;
                 let mut upstream = tokio::net::TcpStream::connect(guest).await?;
                 tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
                 anyhow::Ok(())
             }
             .await;
             if let Err(e) = res {
-                log(format!("{}: proxy error: {e:#}", svc.spec.name));
+                let benign = e.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                    matches!(e.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset)
+                });
+                if !benign {
+                    log(format!("{}: proxy error: {e:#}", inst.id));
+                }
             }
-            *svc.last_activity.lock().unwrap() = Instant::now();
-            svc.active.fetch_sub(1, Ordering::SeqCst);
+            *inst.last_activity.lock().unwrap() = Instant::now();
+            inst.active.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
 
-async fn ensure_awake(ctx: &Ctx, svc: &Service) -> Result<SocketAddr> {
-    let mut vm = svc.vm.lock().await;
-    let addr = SocketAddr::from((vm.slot.guest_ip(), svc.spec.port));
+async fn ensure_awake(ctx: &Ctx, inst: &Instance) -> Result<SocketAddr> {
+    let mut vm = inst.vm.lock().await;
+    if inst.destroyed.load(Ordering::SeqCst) {
+        bail!("instance {} is gone", inst.id);
+    }
+    let addr = SocketAddr::from((vm.slot.guest_ip(), inst.spec.port));
     if vm.is_running() {
         return Ok(addr);
     }
@@ -416,35 +545,69 @@ async fn ensure_awake(ctx: &Ctx, svc: &Service) -> Result<SocketAddr> {
         if vm.has_snapshot() {
             vm.wake(&ctx.paths)
         } else {
-            vm.cold_boot(&ctx.paths, &svc.rootfs)
+            vm.cold_boot(&ctx.paths, &inst.rootfs)
         }?;
-        wait_tcp(addr, Duration::from_secs(60)).map(|_| ())
+        wait_ready(&mut vm, inst.spec.port, None, Duration::from_secs(inst.spec.ready_timeout_secs)).map(|_| ())
     })?;
-    log(format!("{}: woke on request in {}", svc.spec.name, ms(t.elapsed())));
+    log(format!("{}: woke on request in {}", inst.id, ms(t.elapsed())));
     Ok(addr)
 }
 
-/// Local restart + idle sleep. Runs on the host with no control plane involved.
-async fn watchdog(ctx: Arc<Ctx>, svc: Arc<Service>) {
-    let idle = Duration::from_secs(svc.spec.idle_sleep_secs);
+/// Local restart on crash or failed liveness, plus idle sleep. No control plane involved.
+async fn watchdog(ctx: Arc<Ctx>, inst: Arc<Instance>) {
+    let idle = Duration::from_secs(inst.spec.idle_sleep_secs);
+    let every = Duration::from_secs(inst.spec.liveness_secs.max(1));
+    let mut last_probe = Instant::now();
+    let mut fails = 0u32;
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let mut vm = svc.vm.lock().await;
-        if vm.crashed() {
-            log(format!("{}: VM exited; cold booting", svc.spec.name));
-            if let Err(e) = tokio::task::block_in_place(|| vm.cold_boot(&ctx.paths, &svc.rootfs)) {
-                log(format!("{}: restart failed: {e:#}", svc.spec.name));
+        let mut restart = false;
+        if let Some(path) = inst.spec.health_path.clone().filter(|_| last_probe.elapsed() >= every) {
+            last_probe = Instant::now();
+            let target = {
+                let vm = inst.vm.lock().await;
+                vm.is_running().then(|| SocketAddr::from((vm.slot.guest_ip(), inst.spec.port)))
+            };
+            if let Some(addr) = target {
+                let ok = tokio::task::spawn_blocking(move || vm::probe(addr, Some(&path), Duration::from_secs(2)))
+                    .await
+                    .unwrap_or(false);
+                fails = if ok { 0 } else { fails + 1 };
+                if fails > 0 {
+                    log(format!("{}: liveness check failed ({fails}/3)", inst.id));
+                }
+                restart = fails >= 3;
             }
+        }
+        let mut vm = inst.vm.lock().await;
+        if inst.destroyed.load(Ordering::SeqCst) {
+            return;
+        }
+        if vm.crashed() {
+            log(format!("{}: VM exited; cold booting", inst.id));
+            restart = true;
+        } else if restart {
+            log(format!("{}: unhealthy; restarting", inst.id));
+        }
+        if restart {
+            fails = 0;
+            let (port, hp, to) = (inst.spec.port, inst.spec.health_path.clone(), Duration::from_secs(inst.spec.ready_timeout_secs));
+            let res = tokio::task::block_in_place(|| {
+                vm.cold_boot(&ctx.paths, &inst.rootfs).and_then(|_| wait_ready(&mut vm, port, hp.as_deref(), to))
+            });
+            if let Err(e) = res {
+                log(format!("{}: restart failed: {e:#}", inst.id));
+            }
+            last_probe = Instant::now();
             continue;
         }
-        let quiet = svc.last_activity.lock().unwrap().elapsed();
-        if !idle.is_zero() && vm.is_running() && svc.active.load(Ordering::SeqCst) == 0 && quiet > idle {
+        let quiet = inst.last_activity.lock().unwrap().elapsed();
+        if !idle.is_zero() && vm.is_running() && inst.active.load(Ordering::SeqCst) == 0 && quiet > idle {
             let t = Instant::now();
             match tokio::task::block_in_place(|| vm.sleep()) {
-                Ok(()) => log(format!("{}: idle {}s, snapshotted and stopped in {}", svc.spec.name, quiet.as_secs(), ms(t.elapsed()))),
-                Err(e) => log(format!("{}: sleep failed: {e:#}", svc.spec.name)),
+                Ok(()) => log(format!("{}: idle {}s, snapshotted and stopped in {}", inst.id, quiet.as_secs(), ms(t.elapsed()))),
+                Err(e) => log(format!("{}: sleep failed: {e:#}", inst.id)),
             }
         }
     }
 }
-

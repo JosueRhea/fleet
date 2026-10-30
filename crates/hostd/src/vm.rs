@@ -3,6 +3,7 @@
 use crate::firecracker::{BootConfig, Firecracker};
 use crate::net::Slot;
 use anyhow::{bail, Result};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -115,21 +116,46 @@ impl Vm {
         }
     }
 
-    pub fn destroy(mut self) {
+    pub fn destroy(&mut self) {
         self.halt();
         self.slot.destroy();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-/// Poll until something accepts TCP on `addr`; returns how long it took.
-pub fn wait_tcp(addr: SocketAddr, timeout: Duration) -> Result<Duration> {
+/// Startup/readiness gate: polls the health check, failing fast if the VM exits first.
+pub fn wait_ready(vm: &mut Vm, port: u16, health_path: Option<&str>, timeout: Duration) -> Result<Duration> {
+    let addr = SocketAddr::from((vm.slot.guest_ip(), port));
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+        if vm.crashed() {
+            bail!("VM exited during startup after {:?} (app exited or crashed)", start.elapsed());
+        }
+        if probe(addr, health_path, Duration::from_millis(500)) {
             return Ok(start.elapsed());
         }
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(10));
     }
-    bail!("{addr} not reachable after {timeout:?}")
+    bail!("{addr} not ready after {timeout:?}")
+}
+
+/// TCP connect, or an HTTP GET that must answer 2xx/3xx when `path` is set.
+pub fn probe(addr: SocketAddr, path: Option<&str>, timeout: Duration) -> bool {
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, timeout) else { return false };
+    let Some(path) = path else { return true };
+    let _ = s.set_read_timeout(Some(timeout));
+    let _ = s.set_write_timeout(Some(timeout));
+    if write!(s, "GET {path} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n").is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 12];
+    let mut n = 0;
+    while n < buf.len() {
+        match s.read(&mut buf[n..]) {
+            Ok(0) | Err(_) => break,
+            Ok(k) => n += k,
+        }
+    }
+    let line = String::from_utf8_lossy(&buf[..n]);
+    line.starts_with("HTTP/") && matches!(line.split_whitespace().nth(1).and_then(|c| c.chars().next()), Some('2' | '3'))
 }

@@ -16,6 +16,26 @@ Single-host spike for a microVM-first Railway alternative. It turns an OCI image
 3. Guest networking comes from the kernel `ip=` arg: each VM gets a `/30` on `172.30.N.0` and a TAP `mrN`, with egress MASQUERADE.
 4. A host listener on `public_port` proxies to `guest_ip:port`.
 
+### Zero-downtime releases and health checks
+When a service's spec changes (same `public_port`), hostd:
+1. boots the new version as a separate instance (`<name>-<gen>`, its own slot/TAP/rootfs) while the old one keeps serving,
+2. waits for readiness: `GET health_path` must answer 2xx/3xx (TCP connect if unset), up to `ready_timeout_secs` (60). If the VM exits first the release fails immediately,
+3. atomically points the public listener at the new instance (new connections only),
+4. drains the old instance: in-flight connections may finish for up to `drain_secs` (30), then the VM is destroyed.
+
+A release that fails readiness is discarded and the old instance keeps serving; that spec is not retried until it changes. With `health_path` set, a liveness probe runs every `liveness_secs` (5); 3 consecutive failures restart the instance locally.
+
+```json
+{ "name": "web", "image": "nginx:alpine", "port": 80, "public_port": 8080,
+  "health_path": "/", "drain_secs": 30, "ready_timeout_secs": 60, "liveness_secs": 5 }
+```
+
+Verified end to end (real Firecracker VMs, curl every 10 ms):
+- 2 releases + 1 broken release under load: **2815/2815 requests 200**, ~1.15 s from spec change to traffic switch, broken release (app exits) rejected in ~1.3 s.
+- 24 MB download (~8 s) started before a release finished intact on the old instance (drained in 5.3 s); with `drain_secs: 2` it was cut at 2 s.
+- Liveness: `/health` starts failing → restarted after 3 failed probes, healthy again.
+- Removal and shutdown leave 0 Firecracker processes, 0 TAPs, 0 VM dirs.
+
 ### Scale to zero
 After `idle_sleep_secs` with no open connections, hostd pauses the VM, writes a full snapshot (device state + RAM), and kills Firecracker. The next connection is held, the snapshot is restored, and then the connection is forwarded.
 
@@ -61,6 +81,8 @@ Requires Linux with `/dev/kvm`, Docker (for pulling/exporting images), `iptables
 The core design (components, multi-tenancy, zero-downtime releases, failure behaviour) is in [docs/architecture.md](docs/architecture.md).
 
 ## Not done yet / next steps
+- Releases are single-instance per host; multi-replica rolling across hosts is the orchestrator's job (`orchestrator/`), and the edge doesn't exist yet, so the host listener is the router. Liveness restarts are in place (brief blip for that instance).
+- Old instances are killed after draining rather than sent SIGTERM first.
 - No jailer/seccomp/cgroup limits on Firecracker; VMs run as root on the host.
 - Images go through Docker. Next step: pull OCI layers directly and build rootfs without a daemon (or use a block-level layer cache).
 - Restore uses a full RAM file. Next: diff snapshots + UFFD/lazy page loading, plus pre-warmed snapshots taken right after "port ready" so cold deploys become restores.
