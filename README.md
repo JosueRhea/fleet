@@ -56,6 +56,10 @@ curl localhost:8080; curl localhost:8081
 
 Requires Linux with `/dev/kvm`, Docker (for pulling/exporting images), `iptables`, `e2fsprogs`, and root.
 
+## Architecture
+
+The core design (components, multi-tenancy, zero-downtime releases, failure behaviour) is in [docs/architecture.md](docs/architecture.md).
+
 ## Not done yet / next steps
 - No jailer/seccomp/cgroup limits on Firecracker; VMs run as root on the host.
 - Images go through Docker. Next step: pull OCI layers directly and build rootfs without a daemon (or use a block-level layer cache).
