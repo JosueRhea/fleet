@@ -321,6 +321,7 @@ After an instance first passes readiness, `hostd` can take a snapshot of it (pau
 |---|---|---|---|
 | Global plane down | ✅ | ✅ (existing projects) | ✅ |
 | Cell DB / API / orchestrator down | ✅ | ❌ in that cell | ✅ (edge + hostd only) |
+| Temporal Cloud unreachable | ✅ | ⚠️ paused; in-flight deploys resume where they stopped | ✅ |
 | Publisher or state bucket down | ✅ (last-known-good) | ❌ | ✅ |
 | Registry down | ✅ | ❌ new images; restarts use cached rootfs | ✅ |
 | Secrets service down | ✅ | ❌ | ✅ (hostd keeps the wrapped DEK + a sealed local cache for envs it runs) |
@@ -344,7 +345,7 @@ Each step is usable and testable on its own:
 1. **Contracts:** Rust types + JSON schema for the host doc, edge doc, and status report; signing/verification; last-known-good persistence. (Shared crate `ccloud-proto`.)
 2. **hostd reconciler v2:** consumes the host doc (from a local dir, then a bucket); instance state machine; startup/readiness/liveness probes; restart backoff; graceful stop via `microinit` SIGTERM; status reports to a file/HTTP sink; jailer + cgroups.
 3. **Edge proxy v0:** consumes the edge doc; weighted backends; draining; passive + active health; never-eject-last; wake-on-request for sleeping services.
-4. **Orchestrator v0:** single cell, Postgres + durable workflows. Rolling deploy with the §5.3 invariants, auto-rollback, and per-tenant queues. The scheduler is a bin-packer.
+4. **Orchestrator v0:** single cell, Temporal Cloud workflows + Postgres for resources. Rolling deploy with the §5.3 invariants, auto-rollback, and per-tenant queues. The scheduler is a bin-packer.
 5. **Publisher:** DB → signed docs, with diff-size guards.
 6. **Cell API + tenancy:** orgs/projects/envs/services/deployments; authz scoping; rate limits.
 7. **Secrets service + builder pool.**
@@ -355,7 +356,7 @@ Steps 1–3 can be built and tested on a single machine with hand-written docs. 
 
 ## 10. Open decisions
 
-1. **Workflow engine** for the orchestrator: Temporal (proven, heavy) vs a Postgres-backed state machine (simple, fewer moving parts). Leaning Postgres-backed for v0.
+1. ~~Workflow engine~~ **Decided: Temporal Cloud** (namespace per environment, API-key auth). Deploy, rollback, and drain are Temporal workflows; activities call the publisher and read status. Temporal is only on the *change* path: if it is unreachable, deploys pause but running services, restarts, routing, and wake-from-zero are unaffected (§7).
 2. **State bucket:** S3-compatible (MinIO/R2/S3) vs serving docs from the publisher over HTTP with ETags. The bucket is simpler to keep up independently.
 3. **Edge proxy:** build on Pingora vs a custom tokio/hyper proxy.
 4. **Long-lived VMM:** stay on Firecracker for everything vs Cloud Hypervisor for long-lived services (hot-resize).
