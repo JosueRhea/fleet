@@ -278,15 +278,19 @@ fn load_spec(path: &Path, last_good: &Path) -> Result<Spec> {
 
 async fn up(ctx: Arc<Ctx>, spec_path: PathBuf) -> Result<()> {
     net::init_host()?;
+    net::remove_stale_taps();
     std::fs::create_dir_all(&ctx.state_dir)?;
     let last_good = ctx.state_dir.join("last-good-spec.json");
     let mut running: HashMap<String, Running> = HashMap::new();
     let mut last_applied: Option<Spec> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(3));
+    use tokio::signal::unix::{signal, SignalKind};
+    let (mut sigint, mut sigterm) = (signal(SignalKind::interrupt())?, signal(SignalKind::terminate())?);
     loop {
         tokio::select! {
             _ = tick.tick() => {}
-            _ = tokio::signal::ctrl_c() => break,
+            _ = sigint.recv() => break,
+            _ = sigterm.recv() => break,
         }
         let spec = match load_spec(&spec_path, &last_good) {
             Ok(s) => s,

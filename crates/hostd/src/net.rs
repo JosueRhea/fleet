@@ -40,6 +40,18 @@ impl Slot {
     }
 }
 
+/// Drop TAPs left behind by a previous hostd that died without cleaning up.
+pub fn remove_stale_taps() {
+    let Ok(out) = Command::new("ip").args(["-o", "link", "show"]).output() else { return };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(name) = line.split(':').nth(1).map(str::trim) {
+            if name.starts_with("mr") && name[2..].chars().all(|c| c.is_ascii_digit()) {
+                let _ = sh(&["ip", "link", "del", name]);
+            }
+        }
+    }
+}
+
 /// Idempotent host-wide setup: forwarding + masquerade for guest egress.
 pub fn init_host() -> Result<()> {
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
