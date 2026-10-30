@@ -466,34 +466,67 @@ mod tests {
 }
 
 /// The host's X25519 key for opening secrets sealed to it. Generated on first start, never leaves the host.
+/// Reads a hex 32-byte secret key, or creates one (0600) if the file does not exist. Written to a
+/// temp file and linked into place, so a crash never leaves an empty or partial key, and an existing
+/// key (even one that could not be read) is never replaced.
+fn load_or_create_key(path: &Path, kind: &str) -> Result<[u8; 32]> {
+    if let Ok(hex) = std::fs::read_to_string(path) {
+        return from_hex::<32>(hex.trim())
+            .with_context(|| format!("{}: want a hex {kind} key", path.display()));
+    }
+    let mut b = [0u8; 32];
+    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut b)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    std::io::Write::write_all(&mut f, to_hex(&b).as_bytes())?;
+    f.sync_all()?;
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    linked.with_context(|| format!("creating {}", path.display()))?;
+    Ok(b)
+}
+
+/// A host's ed25519 identity key: it signs the host's status reports, which the publisher only
+/// trusts when they verify against the key registered for that host.
+pub struct SignKey(ed25519_dalek::SigningKey);
+
+impl SignKey {
+    pub fn load_or_create(path: &Path) -> Result<SignKey> {
+        Ok(SignKey(ed25519_dalek::SigningKey::from_bytes(
+            &load_or_create_key(path, "ed25519")?,
+        )))
+    }
+
+    pub fn public_hex(&self) -> String {
+        to_hex(self.0.verifying_key().as_bytes())
+    }
+
+    /// `v` as a signed envelope, the same shape the publisher's docs use.
+    pub fn seal<T: Serialize>(&self, v: &T) -> Result<Envelope> {
+        use ed25519_dalek::Signer;
+        let payload = serde_json::to_vec(v)?;
+        Ok(Envelope {
+            key_id: key_id(&self.0.verifying_key()),
+            sig: B64.encode(self.0.sign(&payload).to_bytes()),
+            payload: B64.encode(&payload),
+        })
+    }
+}
+
 pub struct BoxKey(crypto_box::SecretKey);
 
 impl BoxKey {
     pub fn load_or_create(path: &Path) -> Result<BoxKey> {
-        if let Ok(hex) = std::fs::read_to_string(path) {
-            let b = from_hex::<32>(hex.trim())
-                .with_context(|| format!("{}: want a hex X25519 key", path.display()))?;
-            return Ok(BoxKey(crypto_box::SecretKey::from(b)));
-        }
-        let mut b = [0u8; 32];
-        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut b)?;
-        // Write a temp file and link it into place, so a crash never leaves an empty or partial key.
-        use std::os::unix::fs::OpenOptionsExt;
-        let tmp = path.with_extension("tmp");
-        let _ = std::fs::remove_file(&tmp);
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
-        std::io::Write::write_all(&mut f, to_hex(&b).as_bytes())?;
-        f.sync_all()?;
-        // hard_link (unlike rename) fails if the key exists, e.g. present but unreadable: never replace it.
-        let linked = std::fs::hard_link(&tmp, path);
-        let _ = std::fs::remove_file(&tmp);
-        linked.with_context(|| format!("creating {}", path.display()))?;
-        Ok(BoxKey(crypto_box::SecretKey::from(b)))
+        Ok(BoxKey(crypto_box::SecretKey::from(load_or_create_key(
+            path, "X25519",
+        )?)))
     }
 
     pub fn public_hex(&self) -> String {
@@ -571,5 +604,35 @@ mod feature_tests {
             spec(r#","requires":["sealed_env","vsock_secrets"]"#).unsupported_feature(),
             Some("vsock_secrets")
         );
+    }
+}
+
+#[cfg(test)]
+mod sign_tests {
+    use super::*;
+
+    #[test]
+    fn sealed_status_verifies_with_the_hosts_key_only() {
+        let dir = std::env::temp_dir().join(format!("signkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let k = SignKey::load_or_create(&dir.join("a")).unwrap();
+        assert_eq!(
+            SignKey::load_or_create(&dir.join("a"))
+                .unwrap()
+                .public_hex(),
+            k.public_hex()
+        );
+        let env = k.seal(&serde_json::json!({"host_id": "host-a"})).unwrap();
+        let payload = B64.decode(&env.payload).unwrap();
+        let sig = Signature::from_slice(&B64.decode(&env.sig).unwrap()).unwrap();
+        let other = SignKey::load_or_create(&dir.join("b")).unwrap();
+        assert!(k.0.verifying_key().verify_strict(&payload, &sig).is_ok());
+        assert!(other
+            .0
+            .verifying_key()
+            .verify_strict(&payload, &sig)
+            .is_err());
+        assert_eq!(env.key_id, key_id(&k.0.verifying_key()));
     }
 }

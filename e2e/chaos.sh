@@ -21,8 +21,8 @@ W="-services services.json -key signing.key"
 worker() { bin/worker $W >> worker.log 2>&1 & WP=$!; }
 worker; sleep 3
 PE=--preserve-env=CCLOUD_S3_ENDPOINT,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY
-# Register each host's box key, read on the host itself (not from its unsigned status report).
-reg() { bin/hostctl add -key signing.key -id $1 -box-pub $(sudo $R/hostd --state-dir $C/$1 box-pub) >/dev/null; }
+# Register each host's box and sign keys, read on the host itself (not from its status report).
+reg() { bin/hostctl add -key signing.key -id $1 -box-pub $(sudo $R/hostd --state-dir $C/$1 box-pub) -sign-pub $(sudo $R/hostd --state-dir $C/$1 sign-pub) >/dev/null; }
 host() { sudo $PE $R/hostd --state-dir $C/$1 --slots $2 agent --host-id $1 --memory-mib 1024 --trust signing.pub \
   --doc $B/docs/hosts/$1.json --status $B/status/hosts/$1.json >> $1.log 2>&1 & }
 # Two edges behind a health-checking L4 balancer on :9000 (stand-in for a cloud NLB / anycast).
@@ -49,7 +49,9 @@ reg host-a; reg host-b; host host-a 1-100; host host-b 101-200; edge edge-1 9001
 load() { while [ -e $C/loadon ]; do p=$(cat $C/phase); r=$(curl -s -m3 -H 'Host: web.local' -w ' %{http_code}' localhost:9000/cgi-bin/app || echo " 000"); echo "$p $r"; sleep 0.01; done >> $C/codes; }
 dep() { bin/deploy $W -service svc-web "$@" 2>&1 | grep -E '"Status"|"Reason"|Fatal|waiting' | tr -s ' ' | cut -c1-200; }
 phase() { echo "$1" > phase; echo; echo "== $1"; }
-placement() { for h in host-a host-b; do echo "  $h: $(bin/statectl get status/hosts/$h.json 2>/dev/null | grep -o '"state":"[a-z]*"' | sort | uniq -c | tr -s ' \n' ' ')"; done; }
+# A host's status report, unwrapped from its signed envelope.
+hstatus() { bin/statectl get status/hosts/$1.json 2>/dev/null | python3 -c "import json,sys,base64;d=json.load(sys.stdin);print(base64.b64decode(d['payload']).decode() if 'payload' in d else json.dumps(d))" 2>/dev/null; }
+placement() { for h in host-a host-b; do echo "  $h: $(hstatus $h | grep -o '"state":"[a-z]*"' | sort | uniq -c | tr -s ' \n' ' ')"; done; }
 routes() { bin/statectl get docs/edge.json | python3 -c "import json,sys,base64;d=json.loads(base64.b64decode(json.load(sys.stdin)['payload']));print(' '.join(sorted(b['host']+':'+b['state'] for r in d['routes'] for b in r['backends'])))"; }
 repairs() { grep -c "repair started" worker.log; }
 fc() { sleep 1; pgrep -c -x firecracker || true; }
@@ -81,6 +83,19 @@ dep -image webapp:v2 -replicas 2 -bake 5s > dep.out & DP=$!
 sleep 3; sudo kill -9 $(pgrep -f "hostd --state-dir $C/host-b"); sudo kill -9 $(pgrep -f "firecracker.*$C/host-b") 2>/dev/null; echo "  host-b killed"
 wait $DP; cat dep.out; sleep 20; check 2
 phase host-b-back; host host-b 101-200; sleep 8; check 2
+
+phase forged-alive   # host-b dies; someone keeps writing fresh unsigned "alive" reports for it. They must not be
+                     # believed: the worker repairs its instance onto host-a anyway, and no route keeps pointing at it.
+dep -image webapp:v1 -replicas 2 -bake 2s | grep -o '"Status": "[a-z_]*"' | sed 's/^/  spread deploy: /'
+echo "  routes before: $(routes) (expect one on host-b)"
+last=$(hstatus host-b)
+sudo kill -9 $(pgrep -f "hostd --state-dir $C/host-b"); sudo kill -9 $(pgrep -f "firecracker.*$C/host-b") 2>/dev/null; echo "  host-b killed"
+touch forging; (while [ -e forging ]; do echo "$last" | python3 -c "import json,sys,time;d=json.load(sys.stdin);d['reported_at']=int(time.time());print(json.dumps(d))" | bin/statectl put status/hosts/host-b.json; sleep 1; done) & FP=$!
+r0=$(repairs)
+for i in $(seq 60); do [ "$(routes)" = "host-a:active host-a:active" ] && break; sleep 1; done
+echo "  routes after ${i}s of forged reports: $(routes) (expect host-a:active host-a:active)"
+echo "  repairs started: $(( $(repairs) - r0 )) (expect >= 1)"
+rm forging; wait $FP; host host-b 101-200; sleep 8; check 2
 
 phase soak
 for i in $(seq $SOAK); do img=v$(( i % 2 + 1 )); echo "  deploy $i ($img): $(dep -image webapp:$img -replicas 2 -bake 2s | grep -o '"Status": "[a-z_]*"')"; done

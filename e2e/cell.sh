@@ -21,8 +21,8 @@ W="-services services.json -key signing.key"
 bin/worker $W > worker.log 2>&1 & WP=$!
 sleep 3   # worker creates the bucket
 PE=--preserve-env=CCLOUD_S3_ENDPOINT,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY
-# Register each host's box key, read on the host itself (not from its unsigned status report).
-reg() { bin/hostctl add -key signing.key -id $1 -box-pub $(sudo $R/hostd --state-dir $C/$1 box-pub) >/dev/null; }
+# Register each host's box and sign keys, read on the host itself (not from its status report).
+reg() { bin/hostctl add -key signing.key -id $1 -box-pub $(sudo $R/hostd --state-dir $C/$1 box-pub) -sign-pub $(sudo $R/hostd --state-dir $C/$1 sign-pub) >/dev/null; }
 host() { sudo $PE $R/hostd --state-dir $C/$1 --slots $2 agent --host-id $1 --memory-mib 1024 --trust signing.pub \
   --doc $B/docs/hosts/$1.json --status $B/status/hosts/$1.json >> $1.log 2>&1 & }
 reg host-a; reg host-b; host host-a 1-100; host host-b 101-200
@@ -30,7 +30,9 @@ $R/edge --trust signing.pub --doc $B/docs/edge.json --status $B/status/edges/edg
 sleep 4
 load() { while [ -e $C/loadon ]; do p=$(cat $C/phase); r=$(curl -s -m3 -H 'Host: web.local' -w ' %{http_code}' localhost:9000/cgi-bin/app || echo " 000"); echo "$p $r"; sleep 0.01; done >> $C/codes; }
 dep() { echo "$1" > phase; echo "== $1"; bin/deploy $W -service svc-web "${@:2}" 2>&1 | grep -E '"Status"|"Reason"|replacing|Fatal|error' | cut -c1-220; }
-placement() { for h in host-a host-b; do echo "$h: $(bin/statectl get status/hosts/$h.json | grep -o '"state":"[a-z]*"' | sort | uniq -c | tr '\n' ' ')"; done; }
+# A host's status report, unwrapped from its signed envelope.
+hstatus() { bin/statectl get status/hosts/$1.json 2>/dev/null | python3 -c "import json,sys,base64;d=json.load(sys.stdin);print(base64.b64decode(d['payload']).decode() if 'payload' in d else json.dumps(d))" 2>/dev/null; }
+placement() { for h in host-a host-b; do echo "$h: $(hstatus $h | grep -o '"state":"[a-z]*"' | sort | uniq -c | tr '\n' ' ')"; done; }
 fc() { sleep 1; pgrep -c -x firecracker || true; }
 
 echo setup > phase

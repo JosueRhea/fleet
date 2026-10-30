@@ -11,6 +11,7 @@ pub struct Config {
     pub host_id: String,
     pub memory_mib: u32,
     pub box_key: proto::BoxKey,
+    pub sign_key: proto::SignKey,
 }
 
 struct Managed {
@@ -268,7 +269,10 @@ pub async fn run(ctx: Arc<Ctx>, cfg: Config) -> Result<()> {
             .is_none_or(|l| l.applied_version != st.applied_version || l.instances != st.instances);
         if changed || now >= reported_at + 2 {
             st.reported_at = now;
-            match cfg.status.put_json(&st).await {
+            // Signed: the publisher trusts a report (liveness, instance states, addresses it routes
+            // to) only if it verifies against this host's registered key.
+            let sealed = cfg.sign_key.seal(&st)?;
+            match cfg.status.put_json(&sealed).await {
                 Ok(()) => (last_report, reported_at) = (Some(st), now),
                 Err(e) => log(format!("writing status: {e:#}")),
             }

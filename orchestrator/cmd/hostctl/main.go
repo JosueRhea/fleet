@@ -1,12 +1,12 @@
 // Command hostctl manages the cell's signed host registry: the hosts the publisher may place
 // instances on, and the box key each one's secrets are sealed to.
 //
-//	hostctl add -key signing.key -id host-a -box-pub $(hostd --state-dir /var/lib/ccloud box-pub)
+//	hostctl add -key signing.key -id host-a -box-pub $(hostd box-pub) -sign-pub $(hostd sign-pub)
 //	hostctl remove -key signing.key -id host-a
 //	hostctl list -key signing.key
 //
-// Run hostd box-pub on the host itself and carry the key over out of band: a key read from the
-// host's status report is exactly what the registry exists not to trust.
+// Run hostd box-pub and sign-pub on the host itself and carry the keys over out of band: a key read
+// from the host's status report is exactly what the registry exists not to trust.
 package main
 
 import (
@@ -28,6 +28,7 @@ func main() {
 	key := fs.String("key", "/etc/ccloud/signing.key", "publisher ed25519 seed (hex)")
 	id := fs.String("id", "", "host ID (hostd agent --host-id)")
 	boxPub := fs.String("box-pub", "", "the host's X25519 public key (hostd box-pub)")
+	signPub := fs.String("sign-pub", "", "the host's ed25519 public key that signs its status reports (hostd sign-pub)")
 	_ = fs.Parse(os.Args[2:])
 	ctx := context.Background()
 	store, signer, err := cellstate.OpenCell(ctx, *key)
@@ -49,7 +50,12 @@ func main() {
 		if old, ok := reg.Hosts[*id]; ok && old.BoxPub != *boxPub {
 			log.Printf("%s: replacing box key %s", *id, old.BoxPub)
 		}
-		reg.Hosts[*id] = cellstate.RegisteredHost{BoxPub: *boxPub}
+		if *signPub == "" {
+			log.Printf("%s: no -sign-pub: its unsigned status reports will be trusted", *id)
+		} else if _, err := cellstate.ParseKey32(*signPub); err != nil {
+			log.Fatalf("-sign-pub: %v", err)
+		}
+		reg.Hosts[*id] = cellstate.RegisteredHost{BoxPub: *boxPub, SignPub: *signPub}
 	case "remove":
 		if _, ok := reg.Hosts[*id]; !ok {
 			log.Fatalf("%s is not registered", *id)
@@ -62,7 +68,7 @@ func main() {
 		}
 		sort.Strings(ids)
 		for _, h := range ids {
-			fmt.Printf("%s\t%s\n", h, reg.Hosts[h].BoxPub)
+			fmt.Printf("%s\tbox=%s\tsign=%s\n", h, reg.Hosts[h].BoxPub, reg.Hosts[h].SignPub)
 		}
 		return
 	default:

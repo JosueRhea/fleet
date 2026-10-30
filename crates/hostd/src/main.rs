@@ -70,12 +70,21 @@ enum Cmd {
         /// This host's X25519 key for secrets sealed to it (default: <state-dir>/host-box.key, created if missing).
         #[arg(long)]
         box_key: Option<PathBuf>,
+        /// This host's ed25519 key that signs its status reports (default: <state-dir>/host-sign.key, created if missing).
+        #[arg(long)]
+        sign_key: Option<PathBuf>,
     },
     /// Print this host's X25519 public key (creating the key if missing), for `hostctl add -box-pub`.
     BoxPub {
         /// Same as `agent --box-key` (default: <state-dir>/host-box.key).
         #[arg(long)]
         box_key: Option<PathBuf>,
+    },
+    /// Print this host's ed25519 public key (creating the key if missing), for `hostctl add -sign-pub`.
+    SignPub {
+        /// Same as `agent --sign-key` (default: <state-dir>/host-sign.key).
+        #[arg(long)]
+        sign_key: Option<PathBuf>,
     },
     /// Measure cold boot vs snapshot sleep/wake for one image.
     Bench {
@@ -279,6 +288,13 @@ async fn main() -> Result<()> {
                 .await??
         }
         Cmd::Up { spec } => up(ctx, spec).await?,
+        Cmd::SignPub { sign_key } => {
+            std::fs::create_dir_all(&ctx.state_dir)?;
+            let key = proto::SignKey::load_or_create(
+                &sign_key.unwrap_or_else(|| ctx.state_dir.join("host-sign.key")),
+            )?;
+            println!("{}", key.public_hex());
+        }
         Cmd::BoxPub { box_key } => {
             std::fs::create_dir_all(&ctx.state_dir)?;
             let key = proto::BoxKey::load_or_create(
@@ -293,6 +309,7 @@ async fn main() -> Result<()> {
             host_id,
             memory_mib,
             box_key,
+            sign_key,
         } => {
             std::fs::create_dir_all(&ctx.state_dir)?;
             let box_key = proto::BoxKey::load_or_create(
@@ -305,6 +322,9 @@ async fn main() -> Result<()> {
                 host_id,
                 memory_mib,
                 box_key,
+                sign_key: proto::SignKey::load_or_create(
+                    &sign_key.unwrap_or_else(|| ctx.state_dir.join("host-sign.key")),
+                )?,
             };
             agent::run(ctx, cfg).await?
         }

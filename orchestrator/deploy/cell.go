@@ -38,6 +38,9 @@ type Cell struct {
 	// SecretsKey opens stored secret sets so they can be re-sealed to the host that runs an instance.
 	SecretsKey *cellstate.BoxKey
 	mu         sync.Mutex
+
+	statusMu   sync.Mutex
+	lastStatus map[string]hostStatus // last report per host that verified
 }
 
 // sealSecrets opens secret set version of service with the cell key and seals it to host's
@@ -122,26 +125,59 @@ func fresh(reportedAt int64) bool {
 	return time.Since(time.Unix(reportedAt, 0)) <= StaleAfter
 }
 
+// parseHostStatus decodes the report stored under host id's key. A host registered with a sign key
+// must have signed it; one registered without (from before hosts signed) is trusted as written.
+func parseHostStatus(id string, b []byte, reg cellstate.HostRegistry) (hostStatus, bool) {
+	var st hostStatus
+	var env cellstate.Envelope
+	signed := json.Unmarshal(b, &env) == nil && len(env.Sig) > 0
+	rh := reg.Hosts[id]
+	switch {
+	case rh.SignPub != "":
+		if !signed || cellstate.VerifyEnvelope(rh.SignPub, b, &st) != nil {
+			return st, false
+		}
+	case signed:
+		if json.Unmarshal(env.Payload, &st) != nil {
+			return st, false
+		}
+	default:
+		if json.Unmarshal(b, &st) != nil {
+			return st, false
+		}
+	}
+	// Each host writes its own key; a report under one key that names another host is ignored.
+	return st, st.HostID == id
+}
+
+// hosts returns each host's latest trusted status report. A report that does not verify (forged,
+// or written over by anyone with bucket access) is ignored, and the host's last verified report
+// stands, so it goes stale like a host that stopped reporting: never a reason to act at once.
 func (c *Cell) hosts(ctx context.Context) (map[string]hostStatus, error) {
 	objs, err := c.Store.List(ctx, cellstate.HostStatusPrefix)
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]hostStatus{}
+	reg, err := c.registry(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+	if c.lastStatus == nil {
+		c.lastStatus = map[string]hostStatus{}
+	}
 	for k, b := range objs {
 		id, ok := strings.CutSuffix(strings.TrimPrefix(k, cellstate.HostStatusPrefix), ".json")
 		if !ok || strings.Contains(id, "/") {
 			continue // not a status report (List is recursive)
 		}
-		var st hostStatus
-		if err := json.Unmarshal(b, &st); err != nil {
-			return nil, fmt.Errorf("%s: %w", k, err)
+		if st, ok := parseHostStatus(id, b, reg); ok {
+			c.lastStatus[id] = st
 		}
-		// Each host writes its own key; a report under one key that names another host is ignored
-		// (not an error, so one bad object can't stop every deploy and repair in the cell).
-		if st.HostID != id {
-			continue
-		}
+	}
+	out := make(map[string]hostStatus, len(c.lastStatus))
+	for id, st := range c.lastStatus {
 		out[id] = st
 	}
 	return out, nil

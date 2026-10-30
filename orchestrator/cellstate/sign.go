@@ -76,3 +76,20 @@ func (s *Signer) Open(b []byte, doc any) error {
 	}
 	return json.Unmarshal(e.Payload, doc)
 }
+
+// VerifyEnvelope checks an envelope against one hex-encoded ed25519 public key (a host's
+// registered sign key) and decodes its payload into v.
+func VerifyEnvelope(pubHex string, b []byte, v any) error {
+	pub, err := hex.DecodeString(pubHex)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return errors.New("want a hex ed25519 public key")
+	}
+	var e Envelope
+	if err := json.Unmarshal(b, &e); err != nil {
+		return err
+	}
+	if !ed25519.Verify(pub, e.Payload, e.Sig) {
+		return errors.New("bad signature")
+	}
+	return json.Unmarshal(e.Payload, v)
+}

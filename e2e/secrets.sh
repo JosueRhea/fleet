@@ -17,11 +17,13 @@ echo '{"svc-web":{"host":"web.local","port":8000,"health_path":"/health"}}' > se
 W="-services services.json -key signing.key"
 bin/worker $W -secrets-key secrets.key >> worker.log 2>&1 & WP=$!
 PE=--preserve-env=CCLOUD_S3_ENDPOINT,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY
+# A host's status report, unwrapped from its signed envelope.
+hstatus() { bin/statectl get status/hosts/$1.json 2>/dev/null | python3 -c "import json,sys,base64;d=json.load(sys.stdin);print(base64.b64decode(d['payload']).decode() if 'payload' in d else json.dumps(d))" 2>/dev/null; }
 host() { sudo $PE $R/hostd --state-dir $C/$1 --slots $2 agent --host-id $1 --memory-mib 1024 --trust signing.pub \
   --doc $B/docs/hosts/$1.json --status $B/status/hosts/$1.json >> $1.log 2>&1 & }
 for h in host-a:1-100 host-b:101-200; do id=${h%%:*}
-  # Register the box key read on the host itself (not from its unsigned status report).
-  bin/hostctl add -key signing.key -id $id -box-pub $(sudo $R/hostd --state-dir $C/$id box-pub) >/dev/null
+  # Register the box and sign keys, read on the host itself (not from its status report).
+  bin/hostctl add -key signing.key -id $id -box-pub $(sudo $R/hostd --state-dir $C/$id box-pub) -sign-pub $(sudo $R/hostd --state-dir $C/$id sign-pub) >/dev/null
   host $id ${h#*:}
 done
 $R/edge --trust signing.pub --doc $B/docs/edge.json --status $B/status/edges/edge-1.json --state-dir $C/edge --listen 0.0.0.0:9000 >> edge.log 2>&1 & EP=$!
@@ -62,9 +64,16 @@ echo "  app sees: $(get)"
 echo "== app prints its password and exits (expect rolled_back, no plaintext anywhere)"
 docker build -q -t webapp:secret-crash $E/app-secret-crash >/dev/null
 # The console tail of a failed boot goes into the host's status report: capture those while it fails.
-touch caton; (while [ -e caton ]; do for h in host-a host-b; do bin/statectl get status/hosts/$h.json; echo; done; sleep 0.5; done > crash-status) & CP=$!
+# The failed report lives ~1s (until the rollback tombstones the instance): poll each host in its own tight loop.
+touch caton; CPS=""; for h in host-a host-b; do (while [ -e caton ]; do bin/statectl get status/hosts/$h.json; echo; done > crash-raw-$h) & CPS="$CPS $!"; done
 r=$(bin/deploy $W -service svc-web -image webapp:secret-crash -replicas 2 -bake 3s -secrets 1 2>&1)
-rm caton; wait $CP
+rm caton; wait $CPS; cat crash-raw-host-* > crash-raw
+# Reports are signed envelopes: decode them after the fact so the capture loop stays fast.
+python3 -c "
+import json,sys,base64
+for l in open('crash-raw'):
+    try: d=json.loads(l); print(base64.b64decode(d['payload']).decode() if 'payload' in d else l.strip())
+    except Exception: pass" > crash-status
 echo "$r" | grep -E '"Status"' | tr -s ' '
 echo "  status reports with the redacted console line: $(grep -c 'password \*\*\*' crash-status) (expect > 0)"
 echo "  plaintext in status reports: $(grep -c hunter2 crash-status), in deploy result: $(echo "$r" | grep -c hunter2) (expect 0, 0)"
@@ -77,7 +86,7 @@ for i in $(seq 90); do
   r=$(bin/statectl get docs/edge.json | python3 -c "import json,sys,base64;d=json.loads(base64.b64decode(json.load(sys.stdin)['payload']));print(' '.join(sorted(b['host'] for r in d['routes'] for b in r['backends'] if b['state']=='active')))")
   [ "$r" = "host-a host-a" ] && break; sleep 1; done
 echo "  routes after ${i}s: $r (expect host-a host-a)"
-echo "  host-b reports: $(bin/statectl get status/hosts/host-b.json | grep -o 'cannot open sealed_env[^"]*' | head -1)"
+echo "  host-b reports: $(hstatus host-b | grep -o 'cannot open sealed_env[^"]*' | head -1)"
 echo "  repairs started: $(grep -c 'repair started' worker.log)"
 echo "  app sees: $(get)"
 

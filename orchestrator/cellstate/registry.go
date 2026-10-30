@@ -14,6 +14,9 @@ const HostRegistryKey = "docs/host-registry.json"
 
 type RegisteredHost struct {
 	BoxPub string `json:"box_pub"`
+	// SignPub verifies the host's status reports. A host registered without one (registered before
+	// hosts signed their reports) has its unsigned reports trusted until it is re-registered.
+	SignPub string `json:"sign_pub,omitempty"`
 }
 
 type HostRegistry struct {
