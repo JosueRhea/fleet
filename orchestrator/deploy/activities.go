@@ -12,6 +12,8 @@ type Instance struct {
 	ID         string `json:"id"`
 	Host       string `json:"host"`
 	Deployment string `json:"deployment"`
+	Service    string `json:"service,omitempty"`
+	Image      string `json:"image,omitempty"`
 }
 
 type PlaceRequest struct {

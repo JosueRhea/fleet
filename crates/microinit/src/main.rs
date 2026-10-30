@@ -133,7 +133,11 @@ fn main() {
         let mut status = 0;
         let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
         if pid == main_pid {
-            eprintln!("microinit: app exited, status {status}");
+            if libc::WIFEXITED(status) {
+                eprintln!("microinit: app exited with code {}", libc::WEXITSTATUS(status));
+            } else {
+                eprintln!("microinit: app killed by signal {}", libc::WTERMSIG(status));
+            }
             break;
         }
         if pid < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {

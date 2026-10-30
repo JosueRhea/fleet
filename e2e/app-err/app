@@ -1,0 +1,2 @@
+#!/bin/sh
+printf "Status: 500 Oops\r\nContent-Type: text/plain\r\n\r\nbroken"
