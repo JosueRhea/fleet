@@ -101,7 +101,11 @@ func (f *FakeCluster) PublishRoutes(_ context.Context, u RouteUpdate) (int64, er
 	f.version++
 	v := f.version
 	f.mu.Unlock()
-	f.record("routes v%d active=%s draining=%s", v, ids(u.Active), ids(u.Draining))
+	if len(u.Canary) > 0 {
+		f.record("routes v%d active=%s canary=%s@%d%%", v, ids(u.Active), ids(u.Canary), u.CanaryPercent)
+	} else {
+		f.record("routes v%d active=%s draining=%s", v, ids(u.Active), ids(u.Draining))
+	}
 	return v, nil
 }
 

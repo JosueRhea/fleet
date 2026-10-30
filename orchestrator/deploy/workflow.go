@@ -35,6 +35,10 @@ type Input struct {
 	DrainTimeout time.Duration
 	Bake         time.Duration
 	MaxErrorRate float64
+	// CanaryPercent > 0 first routes that share of traffic to one new instance for CanaryBake,
+	// and rolls back before touching any old instance if its error rate is too high.
+	CanaryPercent int
+	CanaryBake    time.Duration
 }
 
 func (in *Input) applyDefaults() {
@@ -49,6 +53,9 @@ func (in *Input) applyDefaults() {
 	}
 	if in.Bake == 0 {
 		in.Bake = 2 * time.Minute
+	}
+	if in.CanaryPercent > 0 && in.CanaryBake == 0 {
+		in.CanaryBake = 30 * time.Second
 	}
 	if in.MaxErrorRate == 0 {
 		in.MaxErrorRate = 0.05
@@ -87,6 +94,12 @@ func RollingDeploy(ctx workflow.Context, in Input) (Result, error) {
 		}),
 		rollbackCh: workflow.GetSignalChannel(ctx, RollbackSignal),
 		oldLeft:    append([]Instance(nil), in.Old...),
+	}
+
+	if in.CanaryPercent > 0 && len(in.Old) > 0 {
+		if res, done := r.canary(); done {
+			return res, nil
+		}
 	}
 
 	replaced := 0
@@ -178,8 +191,12 @@ func (r *rollout) waitReady(ins []Instance) error {
 
 // routes publishes the service's backend set and blocks until edges have applied that version.
 func (r *rollout) routes(active, draining []Instance) error {
+	return r.publish(RouteUpdate{Active: active, Draining: draining})
+}
+
+func (r *rollout) publish(update RouteUpdate) error {
 	var version int64
-	update := RouteUpdate{ServiceID: r.in.ServiceID, Active: active, Draining: draining}
+	update.ServiceID = r.in.ServiceID
 	if err := workflow.ExecuteActivity(r.short, a.PublishRoutes, update).Get(r.ctx, &version); err != nil {
 		return err
 	}
@@ -203,19 +220,63 @@ func (r *rollout) retire(old []Instance) error {
 	return nil
 }
 
+// canary boots one new instance, gives it CanaryPercent of traffic for CanaryBake, then either
+// promotes it to a full-weight backend (retiring one old instance) or rolls back.
+func (r *rollout) canary() (Result, bool) {
+	var batch []Instance
+	req := PlaceRequest{ServiceID: r.in.ServiceID, DeploymentID: r.in.DeploymentID, Image: r.in.Image, Count: 1}
+	fail := func(reason string) (Result, bool) {
+		res, _ := r.rollBack(reason)
+		return res, true
+	}
+	if err := workflow.ExecuteActivity(r.short, a.PlaceInstances, req).Get(r.ctx, &batch); err != nil {
+		return fail("canary placement failed: " + err.Error())
+	}
+	r.created = append(r.created, batch...)
+	if err := r.hosts(HostChange{Start: batch}); err != nil {
+		return fail("publishing canary failed: " + err.Error())
+	}
+	if err := r.waitReady(batch); err != nil {
+		return fail("canary never became ready: " + err.Error())
+	}
+	r.ready = batch
+	if err := r.publish(RouteUpdate{Active: r.oldLeft, Canary: batch, CanaryPercent: r.in.CanaryPercent}); err != nil {
+		return fail("routing canary failed: " + err.Error())
+	}
+	if reason, failed := r.watch(r.in.CanaryBake); failed {
+		return fail("canary: " + reason)
+	}
+	if err := r.routes(r.serving(), nil); err != nil {
+		return fail("promoting canary failed: " + err.Error())
+	}
+	k := min(1, len(r.oldLeft))
+	if len(r.ready) == r.in.Replicas {
+		k = len(r.oldLeft)
+	}
+	retire := append([]Instance(nil), r.oldLeft[:k]...)
+	r.oldLeft = r.oldLeft[k:]
+	if err := r.retire(retire); err != nil {
+		return fail("retiring old instances failed: " + err.Error())
+	}
+	return Result{}, false
+}
+
 func (r *rollout) rollbackRequested() (string, bool) {
 	var reason string
 	ok := r.rollbackCh.ReceiveAsync(&reason)
 	return reason, ok
 }
 
-func (r *rollout) bake() (string, bool) {
+func (r *rollout) bake() (string, bool) { return r.watch(r.in.Bake) }
+
+// watch waits d (or a rollback signal), then checks the new deployment's edge error rate.
+func (r *rollout) watch(d time.Duration) (string, bool) {
 	timerCtx, cancel := workflow.WithCancel(r.ctx)
 	defer cancel()
 	var reason string
 	requested := false
 	sel := workflow.NewSelector(r.ctx)
-	sel.AddFuture(workflow.NewTimer(timerCtx, r.in.Bake), func(workflow.Future) {})
+	sel.AddFuture(workflow.NewTimer(timerCtx, d), func(workflow.Future) {})
 	sel.AddReceive(r.rollbackCh, func(c workflow.ReceiveChannel, _ bool) {
 		c.Receive(r.ctx, &reason)
 		requested = true

@@ -340,6 +340,14 @@ func (c *Cell) PublishRoutes(ctx context.Context, u RouteUpdate) (int64, error) 
 	if err := add(u.Active, 100, "active"); err != nil {
 		return 0, err
 	}
+	if len(u.Canary) > 0 {
+		// Active backends weigh 100 each; size the canary weights so they get CanaryPercent in total.
+		p := min(max(u.CanaryPercent, 1), 99)
+		w := (100*len(u.Active)*p + (100-p)*len(u.Canary) - 1) / ((100 - p) * len(u.Canary))
+		if err := add(u.Canary, max(w, 1), "active"); err != nil {
+			return 0, err
+		}
+	}
 	if err := add(u.Draining, 0, "draining"); err != nil {
 		return 0, err
 	}

@@ -27,6 +27,8 @@ func main() {
 	services := flag.String("services", "/etc/ccloud/services.json", "service config")
 	key := flag.String("key", "/etc/ccloud/signing.key", "publisher ed25519 seed (hex)")
 	bake := flag.Duration("bake", 10*time.Second, "bake window")
+	canary := flag.Int("canary", 0, "route this % of traffic to one new instance first (0 = no canary)")
+	canaryBake := flag.Duration("canary-bake", 30*time.Second, "how long the canary takes its share before promotion")
 	rollbackAfter := flag.Duration("rollback-after", 0, "send a rollback signal after this long (0 = never)")
 	flag.Parse()
 	ctx := context.Background()
@@ -52,7 +54,7 @@ func main() {
 	}
 	defer c.Close()
 
-	in := deploy.Input{ServiceID: *service, DeploymentID: *deployment, Image: *image, Replicas: *replicas, MaxSurge: *surge, Bake: *bake}
+	in := deploy.Input{ServiceID: *service, DeploymentID: *deployment, Image: *image, Replicas: *replicas, MaxSurge: *surge, Bake: *bake, CanaryPercent: *canary, CanaryBake: *canaryBake}
 	in.Old = old
 	log.Printf("replacing %d running instance(s) of %s", len(old), *service)
 	opts := client.StartWorkflowOptions{ID: "deploy-" + *service, TaskQueue: deploy.TaskQueue, WorkflowExecutionErrorWhenAlreadyStarted: true}

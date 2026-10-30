@@ -163,3 +163,33 @@ func TestRepairWithBadReplacementLeavesHealthyServing(t *testing.T) {
 	require.Equal(t, "old-2", ids(res.Active))
 	require.NotContains(t, f.Events(), "stop old-1")
 }
+
+func TestCanaryPromotesThenRollsOn(t *testing.T) {
+	f := &FakeCluster{}
+	in := input("app:v2")
+	in.CanaryPercent = 10
+	res := run(t, f, in, nil)
+	require.Equal(t, StatusActive, res.Status)
+	require.Equal(t, "ins-d2-1,ins-d2-2", ids(res.Active))
+	require.Equal(t, []string{
+		"place 1", "start ins-d2-1", "ready ins-d2-1",
+		"routes v1 active=old-1,old-2 canary=ins-d2-1@10%", "ack v1",
+		"routes v2 active=ins-d2-1,old-1,old-2 draining=", "ack v2",
+		"routes v3 active=ins-d2-1,old-2 draining=old-1", "ack v3",
+	}, f.Events()[:9])
+}
+
+func TestBadCanaryRollsBackWithoutTouchingOld(t *testing.T) {
+	f := &FakeCluster{ErrorRate: 0.5}
+	in := input("app:v2")
+	in.CanaryPercent = 10
+	res := run(t, f, in, nil)
+	require.Equal(t, StatusRolledBack, res.Status)
+	require.Contains(t, res.Reason, "canary: error rate 50.0%")
+	require.Equal(t, "old-1,old-2", ids(res.Active))
+	for _, e := range f.Events() {
+		require.NotContains(t, e, "drained old")
+		require.NotContains(t, e, "sleep old")
+	}
+	require.Contains(t, f.Events(), "stop ins-d2-1")
+}

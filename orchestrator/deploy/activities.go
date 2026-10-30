@@ -37,6 +37,9 @@ type RouteUpdate struct {
 	ServiceID string
 	Active    []Instance
 	Draining  []Instance
+	// Canary backends together get CanaryPercent of the service's traffic; Active gets the rest.
+	Canary        []Instance
+	CanaryPercent int
 }
 
 type HealthReport struct {

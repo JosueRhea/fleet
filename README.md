@@ -119,5 +119,7 @@ Same real cell as `e2e/cell.sh`; breaks one component at a time under curl every
 | hostd `kill -9` + restart | stale Firecracker processes from the old agent are reaped, no leaked VMs | 0 |
 | host killed mid-deploy | `WaitReady` returns `HostLost`; the batch is stopped and re-placed on the surviving host (up to `MaxReplacements`), rollout goes active; host comes back running nothing | 0 |
 | 6 back-to-back deploys + a crash deploy | all active / rolled back | 0 |
+| canary deploy of an app that returns 500 (`-canary 10 -canary-bake 8s`) | one new instance gets ~10% of traffic (edge weights); the edge ejects it after a few 5xx; `canary: error rate 100%` rolls back before any old instance drains | 10 of 555 in that phase (vs. every request for the whole bake without a canary) |
+| canary deploy of a good app | canary promoted to full weight, rollout continues | 0 |
 
-Drained backends are removed from the edge doc after each drain. 0 of 9281 requests failed; shutdown leaves `procs=0 taps=0 vmdirs=0`. Needs `haproxy` for the balancer.
+Drained backends are removed from the edge doc after each drain. Outside the bad-canary phase 0 of 10644 requests failed; shutdown leaves `procs=0 taps=0 vmdirs=0`. Needs `haproxy` for the balancer.

@@ -13,7 +13,7 @@ minio_up() { MINIO_ROOT_USER=$AWS_ACCESS_KEY_ID MINIO_ROOT_PASSWORD=$AWS_SECRET_
 minio_down() { kill $(pgrep -x minio); while pgrep -x minio >/dev/null; do sleep 0.2; done; }
 mkdir -p /tmp/minio-data
 curl -sf -o /dev/null $CCLOUD_S3_ENDPOINT/minio/health/live || minio_up
-for a in v1 v2 crash; do docker build -q -t webapp:$a $E/app-$a >/dev/null; done
+for a in v1 v2 crash err; do docker build -q -t webapp:$a $E/app-$a >/dev/null; done
 (cd $E/../orchestrator && go build -o $C/bin/ ./cmd/worker ./cmd/deploy ./cmd/keygen ./cmd/statectl)
 bin/keygen -key signing.key -pub signing.pub
 echo '{"svc-web":{"host":"web.local","port":8000,"health_path":"/health"}}' > services.json
@@ -84,9 +84,14 @@ phase soak
 for i in $(seq $SOAK); do img=v$(( i % 2 + 1 )); echo "  deploy $i ($img): $(dep -image webapp:$img -replicas 2 -bake 2s | grep -o '"Status": "[a-z_]*"')"; done
 dep -image webapp:crash -replicas 2 -bake 2s | grep -o '"Status": "[a-z_]*"' | sed 's/^/  crash deploy: /'; check 2
 
+phase canary-bad   # app answers 500: only the ~10% canary share sees it, old instances never drain
+dep -image webapp:err -replicas 2 -bake 2s -canary 10 -canary-bake 8s; check 2
+phase canary-good; dep -image webapp:v1 -replicas 2 -bake 2s -canary 10 -canary-bake 5s; check 2
+
 phase after; sleep 2; rm -f loadon; wait $LP
 echo; echo "== responses by phase (phase code)"; awk '{print $1, $NF}' codes | sort | uniq -c
 echo "== draining backends left in the edge doc: $(routes | grep -o draining | wc -l) (expect 0)"
-echo "== non-200: $(awk '$NF!=200' codes | wc -l) of $(wc -l < codes)"
+echo "== canary-bad non-200: $(awk '$1=="canary-bad" && $NF!=200' codes | wc -l) of $(grep -c '^canary-bad ' codes) (canary gets ~10%; the edge ejects it after a few failures)"
+echo "== non-200 outside canary-bad: $(awk '$1!="canary-bad" && $NF!=200' codes | wc -l) of $(wc -l < codes)"
 echo "== shutdown"; sudo kill -INT $(pgrep -x hostd); kill $WP $LBP; pkill -f "state-dir $C/edge-"; sleep 4
 echo "procs=$(pgrep -c -x firecracker) taps=$(ip -br link | grep -c '^mr') vmdirs=$(sudo sh -c "ls $C/host-*/vms 2>/dev/null" | grep -vc ':$\|^$')"
