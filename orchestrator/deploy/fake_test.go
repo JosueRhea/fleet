@@ -20,6 +20,7 @@ type FakeCluster struct {
 	NoTraffic      bool  // Health reports 0 requests
 	Requests       int64 // requests Health reports (default 1000)
 	PlaceErr       error
+	RoutesErr      error
 
 	mu      sync.Mutex
 	events  []string
@@ -104,6 +105,10 @@ func (f *FakeCluster) WaitReady(_ context.Context, ins []Instance, _ time.Durati
 }
 
 func (f *FakeCluster) PublishRoutes(_ context.Context, u RouteUpdate) (int64, error) {
+	if f.RoutesErr != nil {
+		f.record("routes failed")
+		return 0, f.RoutesErr
+	}
 	f.mu.Lock()
 	f.version++
 	v := f.version

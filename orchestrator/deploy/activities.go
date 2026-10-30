@@ -60,6 +60,10 @@ var ErrNotReady = errors.New("instances not ready")
 // ErrSecrets means a deployment's secret set can't be delivered (missing version, no key); retrying won't help.
 var ErrSecrets = errors.New("secrets unavailable")
 
+// ErrNoAddress means an instance to route to has no address, reported or previously routed; it
+// won't appear by retrying.
+var ErrNoAddress = errors.New("no address for instance")
+
 // ErrHostLost means an instance's host stopped reporting while it was booting; the deploy re-places it.
 var ErrHostLost = errors.New("host lost")
 
@@ -104,7 +108,11 @@ func (a *Activities) WaitReady(ctx context.Context, ins []Instance, timeout time
 }
 
 func (a *Activities) PublishRoutes(ctx context.Context, update RouteUpdate) (int64, error) {
-	return a.Cluster.PublishRoutes(ctx, update)
+	v, err := a.Cluster.PublishRoutes(ctx, update)
+	if errors.Is(err, ErrNoAddress) {
+		return 0, temporal.NewNonRetryableApplicationError(err.Error(), "NoAddress", err)
+	}
+	return v, err
 }
 
 func (a *Activities) WaitEdgeAck(ctx context.Context, version int64) error {

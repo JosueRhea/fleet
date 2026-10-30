@@ -417,12 +417,17 @@ func (c *Cell) PublishRoutes(ctx context.Context, u RouteUpdate) (int64, error) 
 	if err != nil {
 		return 0, err
 	}
+	var doc edgeDoc
+	if err := c.readDoc(ctx, cellstate.EdgeDocKey, &doc); err != nil {
+		return 0, err
+	}
+	known := knownAddrs(doc)
 	backends := []backend{}
 	add := func(ins []Instance, weight int, state string) error {
 		for _, in := range ins {
-			addr := c.instance(hs, in).Addr
+			addr := backendAddr(hs, known, in)
 			if addr == "" {
-				return fmt.Errorf("no address reported for %s on %s", in.ID, in.Host)
+				return fmt.Errorf("%w: %s on %s", ErrNoAddress, in.ID, in.Host)
 			}
 			backends = append(backends, backend{Instance: in.ID, Host: in.Host, Deployment: in.Deployment, Addr: addr, Weight: weight, State: state})
 		}
@@ -442,10 +447,6 @@ func (c *Cell) PublishRoutes(ctx context.Context, u RouteUpdate) (int64, error) 
 	if err := add(u.Draining, 0, "draining"); err != nil {
 		return 0, err
 	}
-	var doc edgeDoc
-	if err := c.readDoc(ctx, cellstate.EdgeDocKey, &doc); err != nil {
-		return 0, err
-	}
 	r := route{Host: cfg.Host, Service: u.ServiceID, Backends: backends}
 	replaced := false
 	for i := range doc.Routes {
@@ -461,6 +462,28 @@ func (c *Cell) PublishRoutes(ctx context.Context, u RouteUpdate) (int64, error) 
 		doc.Tombstones = []string{}
 	}
 	return doc.Version, c.writeDoc(ctx, cellstate.EdgeDocKey, doc)
+}
+
+func knownAddrs(doc edgeDoc) map[string]string {
+	out := map[string]string{}
+	for _, r := range doc.Routes {
+		for _, b := range r.Backends {
+			out[b.Instance] = b.Addr
+		}
+	}
+	return out
+}
+
+// backendAddr is the address the instance's host reports, or else the one the edge doc already
+// routes to: a host that stopped reporting (or a status read that came back without it) is not a
+// reason to drop or block routes, and the edge ejects an address it can't connect to.
+func backendAddr(hs map[string]hostStatus, known map[string]string, in Instance) string {
+	for _, s := range hs[in.Host].Instances {
+		if s.ID == in.ID && s.Addr != "" {
+			return s.Addr
+		}
+	}
+	return known[in.ID]
 }
 
 // WaitEdgeAck passes once every live edge reports it is serving routes version >= version.

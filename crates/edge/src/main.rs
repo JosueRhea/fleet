@@ -42,6 +42,9 @@ struct Cli {
 
 const EJECT_AFTER: u32 = 5;
 const EJECT_FOR: Duration = Duration::from_secs(30);
+/// Backends are in the same cell; a connect that takes longer than this is to a dead host, and the
+/// time spent on it comes out of the client's budget before the retry on another backend.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_BODY: usize = 16 << 20;
 
 #[derive(Default)]
@@ -60,6 +63,13 @@ impl Stats {
             .lock()
             .unwrap()
             .is_some_and(|t| Instant::now() < t)
+    }
+    /// A backend that can't be connected to (host gone, VM stopped) is ejected at once: unlike a
+    /// 5xx, retrying it only adds a connect timeout to the next requests' latency.
+    fn connect_failed(&self) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        *self.ejected_until.lock().unwrap() = Some(Instant::now() + EJECT_FOR);
     }
     fn result(&self, ok: bool) {
         if ok {
@@ -225,7 +235,11 @@ impl Edge {
                     return Ok(Response::from_parts(p, body));
                 }
                 Err(e) => {
-                    stats.result(false);
+                    if e.is_connect() {
+                        stats.connect_failed();
+                    } else {
+                        stats.result(false);
+                    }
                     let retry = e.is_connect() || idempotent;
                     log(format!(
                         "{host}: {} failed ({e:?}){}",
@@ -271,7 +285,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&cli.state_dir)?;
     let last_good = cli.state_dir.join("last-good-edge.json");
     let mut connector = HttpConnector::new();
-    connector.set_connect_timeout(Some(Duration::from_secs(2)));
+    connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
     let edge = Arc::new(Edge {
         routes: Default::default(),
         applied: AtomicU64::new(0),
@@ -337,5 +351,25 @@ async fn main() -> Result<()> {
                 .serve_connection(TokioIo::new(conn), svc)
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_failure_ejects_at_once_5xx_after_five() {
+        let s = Stats::default();
+        s.connect_failed();
+        assert!(s.ejected());
+
+        let s = Stats::default();
+        for _ in 0..EJECT_AFTER - 1 {
+            s.result(false);
+        }
+        assert!(!s.ejected());
+        s.result(false);
+        assert!(s.ejected());
     }
 }

@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -234,4 +235,31 @@ func TestFailingCanaryReportsErrorRateEvenOnFewRequests(t *testing.T) {
 	res := run(t, f, in, nil)
 	require.Equal(t, StatusRolledBack, res.Status)
 	require.Contains(t, res.Reason, "canary: error rate 100.0%")
+}
+
+func TestMissingAddressFailsInsteadOfRetryingForever(t *testing.T) {
+	f := &FakeCluster{RoutesErr: fmt.Errorf("%w: ins-d2-1 on host-0", ErrNoAddress)}
+	res := run(t, f, input("app:v2"), nil)
+	require.Equal(t, StatusFailed, res.Status) // rollback can't publish routes either
+	require.Contains(t, res.Reason, "no address for instance")
+	n := 0
+	for _, e := range f.Events() {
+		if e == "routes failed" {
+			n++
+		}
+	}
+	require.Equal(t, 2, n) // once forward, once in rollback: no retries
+}
+
+func TestCanaryReplacedWhenItsHostIsLost(t *testing.T) {
+	f := &FakeCluster{LoseHostOnce: true}
+	in := input("app:v2")
+	in.CanaryPercent = 10
+	res := run(t, f, in, nil)
+	require.Equal(t, StatusActive, res.Status)
+	require.Equal(t, []string{
+		"place 1", "start ins-d2-1", "lost ins-d2-1", "stop ins-d2-1",
+		"place 1", "start ins-d2-2", "ready ins-d2-2",
+		"routes v1 active=old-1,old-2 canary=ins-d2-2@10%",
+	}, f.Events()[:8])
 }

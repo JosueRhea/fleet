@@ -13,7 +13,7 @@ import (
 // HeartbeatTimeout bounds how long a step can stall on a dead worker before Temporal retries it elsewhere.
 const HeartbeatTimeout = 10 * time.Second
 
-// MaxReplacements caps how many batches a deploy re-places after losing their host mid-boot.
+// MaxReplacements caps how many batches (the canary included) a deploy re-places after losing their host mid-boot.
 const MaxReplacements = 2
 
 // PlaceAttempts bounds placement retries (1s backoff doubling to 30s: about two minutes).
@@ -112,7 +112,6 @@ func RollingDeploy(ctx workflow.Context, in Input) (Result, error) {
 		}
 	}
 
-	replaced := 0
 	for len(r.ready) < in.Replicas {
 		if reason, ok := r.rollbackRequested(); ok {
 			return r.rollBack("rollback requested: " + reason)
@@ -128,10 +127,7 @@ func RollingDeploy(ctx workflow.Context, in Input) (Result, error) {
 			return r.rollBack("publishing new instances failed: " + err.Error())
 		}
 		if err := r.waitReady(batch); err != nil {
-			var ae *temporal.ApplicationError
-			if errors.As(err, &ae) && ae.Type() == HostLostType && replaced < MaxReplacements {
-				replaced++
-				workflow.GetLogger(ctx).Warn("host lost while booting; re-placing batch", "err", err)
+			if r.replaceAfterHostLoss(err, batch) {
 				if err := r.hosts(HostChange{Stop: batch}); err != nil {
 					return r.rollBack("stopping instances on a lost host failed: " + err.Error())
 				}
@@ -176,6 +172,19 @@ type rollout struct {
 	ready      []Instance // new instances that passed readiness
 	oldLeft    []Instance // old instances still serving
 	retired    []Instance // old instances drained and asleep
+	replaced   int        // batches (canary included) re-placed after their host was lost
+}
+
+// replaceAfterHostLoss reports whether batch should be stopped and placed again: its host stopped
+// reporting while it booted, and the deploy has re-placements left.
+func (r *rollout) replaceAfterHostLoss(err error, batch []Instance) bool {
+	var ae *temporal.ApplicationError
+	if !errors.As(err, &ae) || ae.Type() != HostLostType || r.replaced >= MaxReplacements {
+		return false
+	}
+	r.replaced++
+	workflow.GetLogger(r.ctx).Warn("host lost while booting; re-placing", "instances", len(batch), "err", err)
+	return true
 }
 
 func (r *rollout) serving() []Instance {
@@ -250,15 +259,26 @@ func (r *rollout) canary() (Result, bool) {
 		res, _ := r.rollBack(reason)
 		return res, true
 	}
-	if err := r.place(req, &batch); err != nil {
-		return fail("canary placement failed: " + err.Error())
-	}
-	r.created = append(r.created, batch...)
-	if err := r.hosts(HostChange{Start: batch}); err != nil {
-		return fail("publishing canary failed: " + err.Error())
-	}
-	if err := r.waitReady(batch); err != nil {
-		return fail("canary never became ready: " + err.Error())
+	for {
+		if err := r.place(req, &batch); err != nil {
+			return fail("canary placement failed: " + err.Error())
+		}
+		r.created = append(r.created, batch...)
+		if err := r.hosts(HostChange{Start: batch}); err != nil {
+			return fail("publishing canary failed: " + err.Error())
+		}
+		err := r.waitReady(batch)
+		if err == nil {
+			break
+		}
+		// Before version 1 a canary that lost its host rolled the deploy back.
+		replace := workflow.GetVersion(r.ctx, "canary-replace-on-host-loss", workflow.DefaultVersion, 1) == 1
+		if !replace || !r.replaceAfterHostLoss(err, batch) {
+			return fail("canary never became ready: " + err.Error())
+		}
+		if err := r.hosts(HostChange{Stop: batch}); err != nil {
+			return fail("stopping canary on a lost host failed: " + err.Error())
+		}
 	}
 	r.ready = batch
 	if err := r.publish(RouteUpdate{Active: r.oldLeft, Canary: batch, CanaryPercent: r.in.CanaryPercent}); err != nil {
