@@ -382,6 +382,7 @@ fn load_spec(path: &Path, last_good: &Path) -> Result<Spec> {
 
 async fn up(ctx: Arc<Ctx>, spec_path: PathBuf) -> Result<()> {
     net::init_host()?;
+    crate::vm::reap_stale(&ctx.state_dir.join("vms"));
     net::remove_stale_taps(&ctx.slot_range);
     let _ = std::fs::remove_dir_all(ctx.state_dir.join("vms"));
     std::fs::create_dir_all(&ctx.state_dir)?;

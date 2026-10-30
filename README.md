@@ -74,7 +74,8 @@ The test runs two hostd agents on one VM (`--slots 1-100` / `101-200`), with cur
 | v1, then v1 → v2 (2 replicas) | active, one replica per host | 0 errors |
 | app crashes on start | rolled back | 0 errors |
 | edge doc payload rewritten without re-signing | edge logs `bad signature`, keeps serving; the deploy built on that doc doesn't run | 0 errors |
-| host-b killed (agent + its VMs) | edge retries onto host-a; the next deploy places both replicas on host-a | 0 errors |
+| host-b killed (agent + its VMs) | edge retries onto host-a; ~10 s later the worker's watcher sees host-b's status go stale and starts a `Repair` workflow, which boots a replacement on host-a, gates on Ready, routes to it and tombstones the lost instance (routes on host-a only ~13 s after the kill, no deploy) | 0 errors |
+| deploy right after repair | the CLI waits for any running deploy/repair of the service, re-reads what's running, then rolls out | 0 errors |
 | host-b restarted | restores its last-good doc, then applies the newer tombstones and runs nothing | 0 errors |
 
 3,500 requests, all 200. 0 Firecracker processes, TAPs or VM dirs after shutdown.
@@ -105,3 +106,18 @@ The core design (components, multi-tenancy, zero-downtime releases, failure beha
 - Networking is IPv4 /30 + NAT per VM. The design calls for IPv6 per VM plus a WireGuard mesh between hosts.
 - No volumes, no metrics, no log shipping (the console log is at `/var/lib/ccloud/vms/<name>/console.log`), and no cross-host scheduler or control plane.
 - Cloud Hypervisor backend for long-lived services.
+
+### Reliability run (`e2e/chaos.sh`)
+
+Same real cell as `e2e/cell.sh`; breaks one component at a time under curl every 10 ms through the edge.
+
+| Fault | Result | Client errors |
+|---|---|---|
+| worker `kill -9` mid-deploy, restarted 6 s later | rollout resumes on the new worker (activities heartbeat, `HeartbeatTimeout` 10 s) and goes active | 0 |
+| state bucket (MinIO) down 20 s | traffic keeps serving from last-good; no false repairs when it returns; next deploy works | 0 |
+| edge-1 `kill -9` (2 edges behind haproxy on :9000), deploy while it's dead, restart | balancer fails over to edge-2; `WaitEdgeAck` only waits on edges with fresh status; edge-1 comes back with last-good routes | 0 |
+| hostd `kill -9` + restart | stale Firecracker processes from the old agent are reaped, no leaked VMs | 0 |
+| host killed mid-deploy | `WaitReady` returns `HostLost`; the batch is stopped and re-placed on the surviving host (up to `MaxReplacements`), rollout goes active; host comes back running nothing | 0 |
+| 6 back-to-back deploys + a crash deploy | all active / rolled back | 0 |
+
+Drained backends are removed from the edge doc after each drain. 0 of 9281 requests failed; shutdown leaves `procs=0 taps=0 vmdirs=0`. Needs `haproxy` for the balancer.

@@ -15,6 +15,8 @@ type FakeCluster struct {
 	FailReadyImage string // images containing this never become ready
 	ErrorRate      float64
 	Logf           func(format string, args ...any)
+	LostReport     LostReport
+	LoseHostOnce   bool // the first WaitReady reports the batch's host as lost
 
 	mu      sync.Mutex
 	events  []string
@@ -44,7 +46,7 @@ func (f *FakeCluster) Place(_ context.Context, req PlaceRequest) ([]Instance, er
 	out := make([]Instance, req.Count)
 	for i := range out {
 		f.next++
-		out[i] = Instance{ID: fmt.Sprintf("ins-%s-%d", req.DeploymentID, f.next), Host: fmt.Sprintf("host-%d", f.next%3), Deployment: req.DeploymentID}
+		out[i] = Instance{ID: fmt.Sprintf("ins-%s-%d", req.DeploymentID, f.next), Host: fmt.Sprintf("host-%d", f.next%3), Deployment: req.DeploymentID, Image: req.Image}
 	}
 	f.mu.Unlock()
 	f.record("place %d", req.Count)
@@ -58,6 +60,9 @@ func (f *FakeCluster) PublishHosts(_ context.Context, c HostChange) error {
 	}
 	for _, i := range c.Start {
 		f.images[i.ID] = c.Image
+		if i.Image != "" {
+			f.images[i.ID] = i.Image
+		}
 	}
 	f.mu.Unlock()
 	for _, step := range []struct {
@@ -74,6 +79,12 @@ func (f *FakeCluster) PublishHosts(_ context.Context, c HostChange) error {
 func (f *FakeCluster) WaitReady(_ context.Context, ins []Instance, _ time.Duration) error {
 	time.Sleep(f.Delay)
 	f.mu.Lock()
+	if f.LoseHostOnce {
+		f.LoseHostOnce = false
+		f.mu.Unlock()
+		f.record("lost %s", ids(ins))
+		return fmt.Errorf("%w: %s stopped reporting", ErrHostLost, ins[0].Host)
+	}
 	for _, i := range ins {
 		if f.FailReadyImage != "" && strings.Contains(f.images[i.ID], f.FailReadyImage) {
 			f.mu.Unlock()
@@ -107,6 +118,11 @@ func (f *FakeCluster) WaitDrained(_ context.Context, ins []Instance, _ time.Dura
 
 func (f *FakeCluster) Health(context.Context, string, string) (HealthReport, error) {
 	return HealthReport{ErrorRate: f.ErrorRate}, nil
+}
+
+func (f *FakeCluster) Lost(context.Context, string) (LostReport, error) {
+	f.record("find lost")
+	return f.LostReport, nil
 }
 
 func ids(ins []Instance) string {

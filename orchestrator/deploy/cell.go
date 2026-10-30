@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/JosueRhea/fleet/orchestrator/cellstate"
+	"go.temporal.io/sdk/activity"
 )
 
 // ServiceConfig is the per-service config the cell API will own.
@@ -258,7 +259,12 @@ func (c *Cell) PublishHosts(ctx context.Context, ch HostChange) error {
 	return nil
 }
 
+// poll sleeps one interval. Inside an activity it heartbeats, so a dead worker's wait is retried
+// on another worker after HeartbeatTimeout instead of blocking until StartToCloseTimeout.
 func (c *Cell) poll(ctx context.Context) error {
+	if activity.IsActivity(ctx) {
+		activity.RecordHeartbeat(ctx)
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -291,7 +297,7 @@ func (c *Cell) WaitReady(ctx context.Context, ins []Instance, timeout time.Durat
 				return fmt.Errorf("%w: %s on %s failed: %.300s", ErrNotReady, in.ID, in.Host, s.Error)
 			}
 			if h, ok := hs[in.Host]; ok && !fresh(h.ReportedAt) {
-				return fmt.Errorf("%w: host %s stopped reporting", ErrNotReady, in.Host)
+				return fmt.Errorf("%w: %s stopped reporting while %s booted", ErrHostLost, in.Host, in.ID)
 			}
 			if s.State == "ready" {
 				ready++
@@ -453,4 +459,40 @@ func (c *Cell) Current(ctx context.Context, service string) ([]Instance, error) 
 		}
 	}
 	return out, nil
+}
+
+// Lost reports which routed instances of service sit on hosts that stopped reporting.
+func (c *Cell) Lost(ctx context.Context, service string) (LostReport, error) {
+	cur, err := c.Current(ctx, service)
+	if err != nil || len(cur) == 0 {
+		return LostReport{}, err
+	}
+	hs, err := c.hosts(ctx)
+	if err != nil {
+		return LostReport{}, err
+	}
+	var rep LostReport
+	docs := map[string]*hostDoc{}
+	for _, in := range cur {
+		if h, ok := hs[in.Host]; ok && fresh(h.ReportedAt) {
+			rep.Healthy = append(rep.Healthy, in)
+			continue
+		}
+		if docs[in.Host] == nil {
+			docs[in.Host] = &hostDoc{}
+			if err := c.readDoc(ctx, cellstate.HostDocKey(in.Host), docs[in.Host]); err != nil {
+				return LostReport{}, err
+			}
+		}
+		for _, s := range docs[in.Host].Instances {
+			if s.ID == in.ID {
+				in.Image = s.Image
+			}
+		}
+		if in.Image == "" {
+			return LostReport{}, fmt.Errorf("lost instance %s is not in host %s's doc", in.ID, in.Host)
+		}
+		rep.Lost = append(rep.Lost, in)
+	}
+	return rep, nil
 }

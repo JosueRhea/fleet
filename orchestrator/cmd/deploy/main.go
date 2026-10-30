@@ -15,6 +15,7 @@ import (
 	"github.com/JosueRhea/fleet/orchestrator/deploy"
 	"github.com/JosueRhea/fleet/orchestrator/tclient"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 )
 
 func main() {
@@ -54,7 +55,16 @@ func main() {
 	in := deploy.Input{ServiceID: *service, DeploymentID: *deployment, Image: *image, Replicas: *replicas, MaxSurge: *surge, Bake: *bake}
 	in.Old = old
 	log.Printf("replacing %d running instance(s) of %s", len(old), *service)
-	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: "deploy-" + *service, TaskQueue: deploy.TaskQueue}, deploy.RollingDeploy, in)
+	opts := client.StartWorkflowOptions{ID: "deploy-" + *service, TaskQueue: deploy.TaskQueue, WorkflowExecutionErrorWhenAlreadyStarted: true}
+	run, err := c.ExecuteWorkflow(ctx, opts, deploy.RollingDeploy, in)
+	for i := 0; i < 10 && temporal.IsWorkflowExecutionAlreadyStartedError(err); i++ {
+		log.Printf("another deploy or repair of %s is running; waiting for it", *service)
+		_ = c.GetWorkflow(ctx, opts.ID, "").Get(ctx, nil)
+		if in.Old, err = cluster.Current(ctx, *service); err != nil {
+			log.Fatalf("current instances: %v", err)
+		}
+		run, err = c.ExecuteWorkflow(ctx, opts, deploy.RollingDeploy, in)
+	}
 	if err != nil {
 		log.Fatalf("start deploy: %v", err)
 	}

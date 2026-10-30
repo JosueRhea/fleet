@@ -52,8 +52,14 @@ bin/statectl put docs/edge.json < edge.orig
 echo host-b-dies > phase; sleep 3; grep -c "unusable" edge.log | sed 's/^/edge rejections after restore (expect still 1): /'
 echo "== kill host-b (agent + its VMs)"
 sudo kill -9 $(pgrep -f "hostd --state-dir $C/host-b"); sudo kill -9 $(pgrep -f "firecracker.*$C/host-b") 2>/dev/null
-sleep 12
-dep after-host-loss -image webapp:v1 -replicas 2 -bake 5s; placement
+t0=$(date +%s); echo "== waiting for the worker to repair (no deploy)"
+for i in $(seq 60); do
+  r=$(bin/statectl get docs/edge.json | python3 -c "import json,sys,base64;d=json.loads(base64.b64decode(json.load(sys.stdin)['payload']));print(' '.join(sorted(b['host'] for r in d['routes'] for b in r['backends'] if b['state']=='active')))")
+  [ "$r" = "host-a host-a" ] && break; sleep 1
+done
+echo "routes: $r after $(( $(date +%s) - t0 ))s"; grep -m1 "repair started" worker.log | cut -c21-; placement
+echo after-host-loss > phase
+dep deploy-after-host-loss -image webapp:v1 -replicas 2 -bake 5s; placement
 
 echo host-b-back > phase; echo "== restart host-b: restores last-good doc, then applies tombstones"
 host host-b 101-200; sleep 8; placement

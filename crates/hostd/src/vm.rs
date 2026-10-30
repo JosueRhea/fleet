@@ -159,3 +159,20 @@ pub fn probe(addr: SocketAddr, path: Option<&str>, timeout: Duration) -> bool {
     let line = String::from_utf8_lossy(&buf[..n]);
     line.starts_with("HTTP/") && matches!(line.split_whitespace().nth(1).and_then(|c| c.chars().next()), Some('2' | '3'))
 }
+
+/// Kill Firecracker processes left by a previous hostd (killed without cleanup) whose VM dirs live under
+/// `vms_dir`. Without this a restarted agent boots fresh copies and the old VMs run on unmanaged.
+pub fn reap_stale(vms_dir: &std::path::Path) {
+    let prefix = vms_dir.to_string_lossy().into_owned();
+    let Ok(procs) = std::fs::read_dir("/proc") else { return };
+    for p in procs.flatten() {
+        let Some(pid) = p.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
+        let Ok(cmd) = std::fs::read(p.path().join("cmdline")) else { continue };
+        let args: Vec<String> = cmd.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+        let is_fc = args.first().is_some_and(|a| a.ends_with("firecracker"));
+        if is_fc && args.windows(2).any(|w| w[0] == "--api-sock" && w[1].starts_with(&prefix)) {
+            crate::log(format!("killing stale firecracker pid {pid} from a previous agent"));
+            let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
+        }
+    }
+}

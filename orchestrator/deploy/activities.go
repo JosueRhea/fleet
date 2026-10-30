@@ -43,7 +43,16 @@ type HealthReport struct {
 	ErrorRate float64
 }
 
+// LostReport splits a service's routed instances by whether their host is still reporting.
+type LostReport struct {
+	Healthy []Instance
+	Lost    []Instance // Image is filled in, so replacements run the same thing
+}
+
 var ErrNotReady = errors.New("instances not ready")
+
+// ErrHostLost means an instance's host stopped reporting while it was booting; the deploy re-places it.
+var ErrHostLost = errors.New("host lost")
 
 // Cluster is everything the deploy workflow needs from the rest of the cell
 // (scheduler, state publisher, status ingest). The workflow never talks to hosts or edges directly.
@@ -55,6 +64,7 @@ type Cluster interface {
 	WaitEdgeAck(ctx context.Context, version int64) error
 	WaitDrained(ctx context.Context, ins []Instance, timeout time.Duration) error
 	Health(ctx context.Context, serviceID, deploymentID string) (HealthReport, error)
+	Lost(ctx context.Context, serviceID string) (LostReport, error)
 }
 
 type Activities struct {
@@ -71,6 +81,9 @@ func (a *Activities) PublishHostChange(ctx context.Context, change HostChange) e
 
 func (a *Activities) WaitReady(ctx context.Context, ins []Instance, timeout time.Duration) error {
 	err := a.Cluster.WaitReady(ctx, ins, timeout)
+	if errors.Is(err, ErrHostLost) {
+		return temporal.NewNonRetryableApplicationError(err.Error(), HostLostType, err)
+	}
 	if errors.Is(err, ErrNotReady) {
 		return temporal.NewNonRetryableApplicationError(err.Error(), "NotReady", err)
 	}
@@ -91,4 +104,8 @@ func (a *Activities) WaitDrained(ctx context.Context, ins []Instance, timeout ti
 
 func (a *Activities) CheckHealth(ctx context.Context, serviceID, deploymentID string) (HealthReport, error) {
 	return a.Cluster.Health(ctx, serviceID, deploymentID)
+}
+
+func (a *Activities) FindLost(ctx context.Context, serviceID string) (LostReport, error) {
+	return a.Cluster.Lost(ctx, serviceID)
 }
