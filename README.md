@@ -74,7 +74,8 @@ The test runs two hostd agents on one VM (`--slots 1-100` / `101-200`), with cur
 | v1, then v1 → v2 (2 replicas) | active, one replica per host | 0 errors |
 | app crashes on start | rolled back | 0 errors |
 | edge doc payload rewritten without re-signing | edge logs `bad signature`, keeps serving; the deploy built on that doc doesn't run | 0 errors |
-| host-b killed (agent + its VMs) | edge retries onto host-a; the next deploy places both replicas on host-a | 0 errors |
+| host-b killed (agent + its VMs) | edge retries onto host-a; ~10 s later the worker's watcher sees host-b's status go stale and starts a `Repair` workflow, which boots a replacement on host-a, gates on Ready, routes to it and tombstones the lost instance (routes on host-a only ~13 s after the kill, no deploy) | 0 errors |
+| deploy right after repair | the CLI waits for any running deploy/repair of the service, re-reads what's running, then rolls out | 0 errors |
 | host-b restarted | restores its last-good doc, then applies the newer tombstones and runs nothing | 0 errors |
 
 3,500 requests, all 200. 0 Firecracker processes, TAPs or VM dirs after shutdown.

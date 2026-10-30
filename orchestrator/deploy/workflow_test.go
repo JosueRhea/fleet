@@ -106,3 +106,46 @@ func TestFirstDeployHasNoOldInstances(t *testing.T) {
 	require.Equal(t, StatusActive, res.Status)
 	require.Equal(t, "ins-d2-1,ins-d2-2", ids(res.Active))
 }
+
+func TestRepairReplacesInstancesOnLostHosts(t *testing.T) {
+	f := &FakeCluster{LostReport: LostReport{
+		Healthy: []Instance{{ID: "old-2", Host: "host-a", Deployment: "d1"}},
+		Lost:    []Instance{{ID: "old-1", Host: "host-b", Deployment: "d1", Image: "app:v1"}},
+	}}
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestWorkflowEnvironment()
+	env.RegisterActivity(&Activities{Cluster: f})
+	env.ExecuteWorkflow(Repair, RepairInput{ServiceID: "svc"})
+	require.NoError(t, env.GetWorkflowError())
+	var res RepairResult
+	require.NoError(t, env.GetWorkflowResult(&res))
+	require.Equal(t, "old-2,ins-d1-1", ids(res.Active))
+	require.Equal(t, []string{
+		"find lost",
+		"routes v1 active=old-2 draining=",
+		"ack v1",
+		"place 1",
+		"start ins-d1-1",
+		"ready ins-d1-1",
+		"routes v2 active=old-2,ins-d1-1 draining=",
+		"ack v2",
+		"stop old-1",
+	}, f.Events())
+}
+
+func TestRepairWithBadReplacementLeavesHealthyServing(t *testing.T) {
+	f := &FakeCluster{FailReadyImage: "bad", LostReport: LostReport{
+		Healthy: []Instance{{ID: "old-2", Host: "host-a", Deployment: "d1"}},
+		Lost:    []Instance{{ID: "old-1", Host: "host-b", Deployment: "d1", Image: "app:bad"}},
+	}}
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestWorkflowEnvironment()
+	env.RegisterActivity(&Activities{Cluster: f})
+	env.ExecuteWorkflow(Repair, RepairInput{ServiceID: "svc"})
+	require.NoError(t, env.GetWorkflowError())
+	var res RepairResult
+	require.NoError(t, env.GetWorkflowResult(&res))
+	require.Contains(t, res.Reason, "never became ready")
+	require.Equal(t, "old-2", ids(res.Active))
+	require.NotContains(t, f.Events(), "stop old-1")
+}
