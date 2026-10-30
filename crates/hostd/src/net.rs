@@ -41,11 +41,11 @@ impl Slot {
 }
 
 /// Drop TAPs left behind by a previous hostd that died without cleaning up.
-pub fn remove_stale_taps() {
+pub fn remove_stale_taps(range: &std::ops::RangeInclusive<u8>) {
     let Ok(out) = Command::new("ip").args(["-o", "link", "show"]).output() else { return };
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if let Some(name) = line.split(':').nth(1).map(str::trim) {
-            if name.starts_with("mr") && name[2..].chars().all(|c| c.is_ascii_digit()) {
+            if name.strip_prefix("mr").and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| range.contains(&n)) {
                 let _ = sh(&["ip", "link", "del", name]);
             }
         }

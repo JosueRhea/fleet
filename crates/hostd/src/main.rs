@@ -4,6 +4,8 @@ mod image;
 mod net;
 mod vm;
 
+use ccloud_proto as proto;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -31,6 +33,9 @@ struct Cli {
     /// Guest PID 1 binary; defaults to `microinit` next to this executable.
     #[arg(long, env = "CCLOUD_INIT", global = true)]
     init: Option<PathBuf>,
+    /// VM slots (TAP mr<N>, subnet 172.30.N.0/30) this hostd may use, e.g. `1-120`.
+    #[arg(long, default_value = "1-249", global = true)]
+    slots: String,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -43,10 +48,20 @@ enum Cmd {
     Up { spec: PathBuf },
     /// Run the instances in a host doc (from the control plane) and write status reports.
     Agent {
+        /// Host doc: a path or s3://bucket/key.
         #[arg(long)]
-        doc: PathBuf,
+        doc: String,
+        /// Where to write status reports: a path or s3://bucket/key.
         #[arg(long)]
-        status: PathBuf,
+        status: String,
+        /// Hex ed25519 public key(s) of the publisher; unsigned or untrusted docs are rejected.
+        #[arg(long, required = true)]
+        trust: Vec<PathBuf>,
+        #[arg(long, default_value = "local")]
+        host_id: String,
+        /// Memory this host offers to instances (reported to the scheduler).
+        #[arg(long, default_value_t = 4096)]
+        memory_mib: u32,
     },
     /// Measure cold boot vs snapshot sleep/wake for one image.
     Bench {
@@ -118,13 +133,14 @@ struct Ctx {
     init: PathBuf,
     state_dir: PathBuf,
     slots: std::sync::Mutex<HashSet<u8>>,
+    slot_range: std::ops::RangeInclusive<u8>,
     next_gen: AtomicU64,
 }
 
 impl Ctx {
     fn alloc_slot(&self) -> Result<u8> {
         let mut used = self.slots.lock().unwrap();
-        let idx = (1..=249u8).find(|i| !used.contains(i)).context("out of VM slots")?;
+        let idx = self.slot_range.clone().find(|i| !used.contains(i)).context("out of VM slots")?;
         used.insert(idx);
         Ok(idx)
     }
@@ -170,8 +186,13 @@ async fn main() -> Result<()> {
     if !cli.kernel.exists() {
         bail!("guest kernel not found at {} (run scripts/fetch-kernel.sh)", cli.kernel.display());
     }
+    let slot_range = match cli.slots.split_once('-').map(|(a, b)| (a.parse::<u8>(), b.parse::<u8>())) {
+        Some((Ok(a), Ok(b))) if a >= 1 && a <= b && b <= 249 => a..=b,
+        _ => bail!("--slots wants a range like 1-120 within 1-249"),
+    };
     let ctx = Arc::new(Ctx {
         slots: Default::default(),
+        slot_range,
         next_gen: Default::default(),
         paths: Paths { firecracker: cli.firecracker, kernel: cli.kernel },
         init,
@@ -187,7 +208,16 @@ async fn main() -> Result<()> {
             tokio::task::spawn_blocking(move || bench(&ctx, &image, port, runs, vcpus, memory_mib)).await??
         }
         Cmd::Up { spec } => up(ctx, spec).await?,
-        Cmd::Agent { doc, status } => agent::run(ctx, doc, status).await?,
+        Cmd::Agent { doc, status, trust, host_id, memory_mib } => {
+            let cfg = agent::Config {
+                doc: proto::Loc::parse(&doc)?,
+                status: proto::Loc::parse(&status)?,
+                trust: proto::Trust::load(&trust)?,
+                host_id,
+                memory_mib,
+            };
+            agent::run(ctx, cfg).await?
+        }
     }
     Ok(())
 }
@@ -352,7 +382,7 @@ fn load_spec(path: &Path, last_good: &Path) -> Result<Spec> {
 
 async fn up(ctx: Arc<Ctx>, spec_path: PathBuf) -> Result<()> {
     net::init_host()?;
-    net::remove_stale_taps();
+    net::remove_stale_taps(&ctx.slot_range);
     let _ = std::fs::remove_dir_all(ctx.state_dir.join("vms"));
     std::fs::create_dir_all(&ctx.state_dir)?;
     let last_good = ctx.state_dir.join("last-good-spec.json");

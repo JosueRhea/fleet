@@ -22,11 +22,18 @@ use std::time::{Duration, Instant};
 #[command(about = "ccloud edge proxy")]
 struct Cli {
     /// Edge desired-state doc to pull.
+    /// Edge doc: a path or s3://bucket/key.
     #[arg(long)]
-    doc: PathBuf,
+    doc: String,
     /// Where to write the status report (applied version + backend stats).
+    /// Where to write status reports: a path or s3://bucket/key.
     #[arg(long)]
-    status: PathBuf,
+    status: String,
+    /// Hex ed25519 public key(s) of the publisher; unsigned or untrusted docs are rejected.
+    #[arg(long, required = true)]
+    trust: Vec<PathBuf>,
+    #[arg(long, default_value = "edge-1")]
+    edge_id: String,
     #[arg(long, default_value = "/var/lib/ccloud/edge")]
     state_dir: PathBuf,
     #[arg(long, default_value = "0.0.0.0:8000")]
@@ -206,7 +213,7 @@ impl Edge {
                 ejected: s.ejected(),
             })
             .collect();
-        proto::EdgeStatus { applied_version: self.applied.load(Ordering::SeqCst), backends }
+        proto::EdgeStatus { edge_id: String::new(), reported_at: 0, applied_version: self.applied.load(Ordering::SeqCst), backends }
     }
 }
 
@@ -224,16 +231,19 @@ async fn main() -> Result<()> {
         rr: AtomicUsize::new(0),
         client: Client::builder(TokioExecutor::new()).pool_idle_timeout(Duration::from_secs(5)).build(connector),
     });
-    if let Some(doc) = proto::load_last_good::<EdgeDoc>(&last_good) {
+    let (doc_loc, status_loc) = (proto::Loc::parse(&cli.doc)?, proto::Loc::parse(&cli.status)?);
+    let trust = proto::Trust::load(&cli.trust)?;
+    if let Some(doc) = proto::load_last_good::<EdgeDoc>(&last_good, &trust) {
         log("restoring last-known-good edge doc");
         edge.apply(doc);
     }
+    let edge_id = cli.edge_id.clone();
     tokio::spawn({
         let edge = edge.clone();
         async move {
             let mut last_err = String::new();
             loop {
-                match proto::load_newer::<EdgeDoc>(&cli.doc, &last_good, edge.applied.load(Ordering::SeqCst)) {
+                match proto::load_newer::<EdgeDoc>(&doc_loc, &trust, &last_good, edge.applied.load(Ordering::SeqCst)).await {
                     Ok(Some(doc)) => edge.apply(doc),
                     Ok(None) => last_err.clear(),
                     Err(e) => {
@@ -244,7 +254,9 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                if let Err(e) = proto::write_atomic(&cli.status, &edge.status()) {
+                let mut st = edge.status();
+                (st.edge_id, st.reported_at) = (edge_id.clone(), proto::unix_now());
+                if let Err(e) = status_loc.put_json(&st).await {
                     log(format!("writing status: {e:#}"));
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;

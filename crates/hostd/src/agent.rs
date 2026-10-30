@@ -2,7 +2,15 @@
 //! the edge sends traffic to Ready instances. Nothing here needs the control plane to be up.
 
 use super::*;
-use ccloud_proto::{self as proto, Desired, HostDoc, InstanceSpec, InstanceState, InstanceStatus};
+use ccloud_proto::{Desired, HostDoc, InstanceSpec, InstanceState, InstanceStatus};
+
+pub struct Config {
+    pub doc: proto::Loc,
+    pub status: proto::Loc,
+    pub trust: proto::Trust,
+    pub host_id: String,
+    pub memory_mib: u32,
+}
 
 struct Managed {
     spec: InstanceSpec,
@@ -55,21 +63,22 @@ async fn teardown(ctx: &Ctx, m: Managed) {
     }
 }
 
-pub async fn run(ctx: Arc<Ctx>, doc_path: PathBuf, status_path: PathBuf) -> Result<()> {
+pub async fn run(ctx: Arc<Ctx>, cfg: Config) -> Result<()> {
     net::init_host()?;
-    net::remove_stale_taps();
+    net::remove_stale_taps(&ctx.slot_range);
     let _ = std::fs::remove_dir_all(ctx.state_dir.join("vms"));
     std::fs::create_dir_all(&ctx.state_dir)?;
     let last_good = ctx.state_dir.join("last-good-host.json");
     let mut applied = 0;
     let mut wanted = BTreeMap::new();
-    if let Some(doc) = proto::load_last_good::<HostDoc>(&last_good) {
+    if let Some(doc) = proto::load_last_good::<HostDoc>(&last_good, &cfg.trust) {
         log(format!("restoring last-known-good host doc v{}", doc.version));
         applied = doc.version;
         merge(&mut wanted, doc);
     }
     let mut managed: HashMap<String, Managed> = HashMap::new();
     let mut last_err = String::new();
+    let (mut last_report, mut reported_at) = (None::<proto::HostStatus>, 0u64);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     use tokio::signal::unix::{signal, SignalKind};
     let (mut sigint, mut sigterm) = (signal(SignalKind::interrupt())?, signal(SignalKind::terminate())?);
@@ -79,7 +88,7 @@ pub async fn run(ctx: Arc<Ctx>, doc_path: PathBuf, status_path: PathBuf) -> Resu
             _ = sigint.recv() => break,
             _ = sigterm.recv() => break,
         }
-        match proto::load_newer::<HostDoc>(&doc_path, &last_good, applied) {
+        match proto::load_newer::<HostDoc>(&cfg.doc, &cfg.trust, &last_good, applied).await {
             Ok(Some(doc)) => {
                 log(format!("applied host doc v{} ({} instances, {} tombstones)", doc.version, doc.instances.len(), doc.tombstones.len()));
                 applied = doc.version;
@@ -179,8 +188,24 @@ pub async fn run(ctx: Arc<Ctx>, doc_path: PathBuf, status_path: PathBuf) -> Resu
             })
             .collect();
         instances.sort_by(|a, b| a.id.cmp(&b.id));
-        if let Err(e) = proto::write_atomic(&status_path, &proto::HostStatus { applied_version: applied, instances }) {
-            log(format!("writing status: {e:#}"));
+        let memory_mib_used = managed.values().filter(|m| m.state != InstanceState::Sleeping).map(|m| m.spec.memory_mib).sum();
+        let mut st = proto::HostStatus {
+            host_id: cfg.host_id.clone(),
+            reported_at,
+            memory_mib_total: cfg.memory_mib,
+            memory_mib_used,
+            applied_version: applied,
+            instances,
+        };
+        // Report on change, and every 2 s so the scheduler knows this host is alive.
+        let now = proto::unix_now();
+        let changed = last_report.as_ref().is_none_or(|l| l.applied_version != st.applied_version || l.instances != st.instances);
+        if changed || now >= reported_at + 2 {
+            st.reported_at = now;
+            match cfg.status.put_json(&st).await {
+                Ok(()) => (last_report, reported_at) = (Some(st), now),
+                Err(e) => log(format!("writing status: {e:#}")),
+            }
         }
     }
     log("shutting down");

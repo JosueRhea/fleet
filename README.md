@@ -63,18 +63,21 @@ From `hostd up examples/services.json`:
 
 This was measured on nested virtualization; expect bare metal to be faster. Cold boot is dominated by guest userspace startup plus the kernel. The restore cost scales with the size of the snapshotted RAM (it is a full, file-backed snapshot).
 
-## Full stack: Temporal Cloud → hostd agent → edge (`e2e/stack.sh`)
+## One cell: Temporal Cloud → signed docs in S3 → 2 hostd agents + edge (`e2e/cell.sh`)
 
-No simulated parts: the Temporal worker writes `host.json`/`edge.json`, a real `hostd agent` boots Firecracker VMs and reports `host-status.json`, a real `edge` proxy routes traffic and reports `edge-status.json`, and the workflow gates on those reports. curl hits the edge every 10 ms during five deploys (2 replicas each):
+The worker is the cell's publisher: it writes ed25519-signed host and edge docs to an S3-compatible bucket (MinIO in the test) and reads the status reports that hostd agents and edges `PUT` there. Each hostd and the edge pull their doc, reject anything that doesn't verify against `--trust`, and keep the last good signed copy on disk. The scheduler spreads replicas across live hosts (hosts that reported in the last 10 s) by free memory.
 
-| Deploy | Result | What clients saw |
+The test runs two hostd agents on one VM (`--slots 1-100` / `101-200`), with curl through the edge every 10 ms:
+
+| Step | Result | Clients |
 |---|---|---|
-| v1 → v2 (rolling, surge 1) | active | 204× v1, 664× v2, 0 errors |
-| app exits on start | rolled_back (not ready, ~1 s) | 145× v2, 0 errors |
-| app returns 500 | rolled_back (edge error rate 100% in bake) | 267× v2, 487× 500 during the bake window |
-| v1 + manual rollback signal | rolled_back | 290× v1, 260× v2, 0 errors |
+| v1, then v1 → v2 (2 replicas) | active, one replica per host | 0 errors |
+| app crashes on start | rolled back | 0 errors |
+| edge doc payload rewritten without re-signing | edge logs `bad signature`, keeps serving; the deploy built on that doc doesn't run | 0 errors |
+| host-b killed (agent + its VMs) | edge retries onto host-a; the next deploy places both replicas on host-a | 0 errors |
+| host-b restarted | restores its last-good doc, then applies the newer tombstones and runs nothing | 0 errors |
 
-After each deploy exactly 2 Firecracker processes remained; after shutdown 0 processes, 0 TAPs, 0 VM dirs. Rollbacks wake the snapshotted old instances (~30 ms). A bad release that passes readiness gets full traffic until the bake catches it; canary weights are the fix.
+3,500 requests, all 200. 0 Firecracker processes, TAPs or VM dirs after shutdown.
 
 ## Run it
 
