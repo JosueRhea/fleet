@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/JosueRhea/fleet/orchestrator/cellstate"
+	"go.temporal.io/sdk/activity"
 )
 
 // ServiceConfig is the per-service config the cell API will own.
@@ -258,7 +259,12 @@ func (c *Cell) PublishHosts(ctx context.Context, ch HostChange) error {
 	return nil
 }
 
+// poll sleeps one interval. Inside an activity it heartbeats, so a dead worker's wait is retried
+// on another worker after HeartbeatTimeout instead of blocking until StartToCloseTimeout.
 func (c *Cell) poll(ctx context.Context) error {
+	if activity.IsActivity(ctx) {
+		activity.RecordHeartbeat(ctx)
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()

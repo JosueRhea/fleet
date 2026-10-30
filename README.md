@@ -106,3 +106,18 @@ The core design (components, multi-tenancy, zero-downtime releases, failure beha
 - Networking is IPv4 /30 + NAT per VM. The design calls for IPv6 per VM plus a WireGuard mesh between hosts.
 - No volumes, no metrics, no log shipping (the console log is at `/var/lib/ccloud/vms/<name>/console.log`), and no cross-host scheduler or control plane.
 - Cloud Hypervisor backend for long-lived services.
+
+### Reliability run (`e2e/chaos.sh`)
+
+Same real cell as `e2e/cell.sh`; breaks one component at a time under curl every 10 ms through the edge.
+
+| Fault | Result | Client errors |
+|---|---|---|
+| worker `kill -9` mid-deploy, restarted 6 s later | rollout resumes on the new worker (activities heartbeat, `HeartbeatTimeout` 10 s) and goes active | 0 |
+| state bucket (MinIO) down 20 s | traffic keeps serving from last-good; no false repairs when it returns; next deploy works | 0 |
+| edge `kill -9` + restart | restores last-good routes from its state dir | ~1 s gap (single edge) |
+| hostd `kill -9` + restart | stale Firecracker processes from the old agent are reaped, no leaked VMs | 0 |
+| host killed mid-deploy | rollout rolls back, traffic stays on the surviving host; host comes back running nothing | 0 |
+| 6 back-to-back deploys + a crash deploy | all active / rolled back | 0 |
+
+Shutdown leaves `procs=0 taps=0 vmdirs=0`.

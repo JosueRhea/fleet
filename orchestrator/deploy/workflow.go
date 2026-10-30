@@ -9,6 +9,9 @@ import (
 	"go.temporal.io/sdk/workflow"
 )
 
+// HeartbeatTimeout bounds how long a step can stall on a dead worker before Temporal retries it elsewhere.
+const HeartbeatTimeout = 10 * time.Second
+
 const (
 	TaskQueue      = "ccloud-deploy"
 	RollbackSignal = "rollback"
@@ -72,6 +75,7 @@ func RollingDeploy(ctx workflow.Context, in Input) (Result, error) {
 		ctx: ctx,
 		short: workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 			StartToCloseTimeout: time.Minute,
+			HeartbeatTimeout:    HeartbeatTimeout,
 			RetryPolicy:         &temporal.RetryPolicy{InitialInterval: time.Second, MaximumInterval: 30 * time.Second},
 		}),
 		rollbackCh: workflow.GetSignalChannel(ctx, RollbackSignal),
@@ -141,6 +145,7 @@ func (r *rollout) serving() []Instance {
 func (r *rollout) waitCtx(d time.Duration) workflow.Context {
 	return workflow.WithActivityOptions(r.ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: d + 30*time.Second,
+		HeartbeatTimeout:    HeartbeatTimeout,
 		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 3},
 	})
 }

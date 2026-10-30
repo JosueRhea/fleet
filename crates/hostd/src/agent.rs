@@ -65,6 +65,7 @@ async fn teardown(ctx: &Ctx, m: Managed) {
 
 pub async fn run(ctx: Arc<Ctx>, cfg: Config) -> Result<()> {
     net::init_host()?;
+    crate::vm::reap_stale(&ctx.state_dir.join("vms"));
     net::remove_stale_taps(&ctx.slot_range);
     let _ = std::fs::remove_dir_all(ctx.state_dir.join("vms"));
     std::fs::create_dir_all(&ctx.state_dir)?;

@@ -47,14 +47,18 @@ func main() {
 // the deploy workflow ID, so a running deploy or repair for the service makes this a no-op.
 func watchHosts(c client.Client, cluster *deploy.Cell) {
 	ctx := context.Background()
+	// After the state bucket was unreachable every host looks stale until it reports again; that's
+	// not a host failure, so wait out StaleAfter before trusting staleness again.
+	var bucketErr time.Time
 	for range time.Tick(3 * time.Second) {
 		for svc := range cluster.Services {
 			rep, err := cluster.Lost(ctx, svc)
 			if err != nil {
+				bucketErr = time.Now()
 				log.Printf("%s: checking for lost instances: %v", svc, err)
 				continue
 			}
-			if len(rep.Lost) == 0 {
+			if len(rep.Lost) == 0 || time.Since(bucketErr) < deploy.StaleAfter {
 				continue
 			}
 			opts := client.StartWorkflowOptions{ID: "deploy-" + svc, TaskQueue: deploy.TaskQueue, WorkflowExecutionErrorWhenAlreadyStarted: true}

@@ -31,6 +31,7 @@ func Repair(ctx workflow.Context, in RepairInput) (RepairResult, error) {
 		ctx: ctx,
 		short: workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 			StartToCloseTimeout: time.Minute,
+			HeartbeatTimeout:    HeartbeatTimeout,
 			RetryPolicy:         &temporal.RetryPolicy{InitialInterval: time.Second, MaximumInterval: 30 * time.Second},
 		}),
 	}
