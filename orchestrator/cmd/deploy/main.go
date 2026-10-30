@@ -19,13 +19,24 @@ import (
 func main() {
 	service := flag.String("service", "svc-demo", "service ID")
 	deployment := flag.String("deployment", fmt.Sprintf("d%d", time.Now().Unix()), "new deployment ID")
-	image := flag.String("image", "app:v2", "image (contains \"bad\" = fails readiness in the fake cluster)")
+	image := flag.String("image", "", "OCI image to deploy")
 	replicas := flag.Int("replicas", 2, "replicas")
 	surge := flag.Int("max-surge", 1, "max surge")
-	old := flag.Int("old", 2, "number of currently running instances to replace")
+	dir := flag.String("dir", "/var/lib/ccloud/cell", "cell state dir (services.json, edge.json)")
 	bake := flag.Duration("bake", 10*time.Second, "bake window")
 	rollbackAfter := flag.Duration("rollback-after", 0, "send a rollback signal after this long (0 = never)")
 	flag.Parse()
+	if *image == "" {
+		log.Fatal("-image is required")
+	}
+	cluster, err := deploy.NewDocs(*dir, "")
+	if err != nil {
+		log.Fatal(err)
+	}
+	old, err := cluster.Current(*service)
+	if err != nil {
+		log.Fatalf("current instances: %v", err)
+	}
 
 	c, err := tclient.Dial()
 	if err != nil {
@@ -34,9 +45,8 @@ func main() {
 	defer c.Close()
 
 	in := deploy.Input{ServiceID: *service, DeploymentID: *deployment, Image: *image, Replicas: *replicas, MaxSurge: *surge, Bake: *bake}
-	for i := 1; i <= *old; i++ {
-		in.Old = append(in.Old, deploy.Instance{ID: fmt.Sprintf("old-%d", i), Deployment: "previous"})
-	}
+	in.Old = old
+	log.Printf("replacing %d running instance(s) of %s", len(old), *service)
 	ctx := context.Background()
 	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: "deploy-" + *service, TaskQueue: deploy.TaskQueue}, deploy.RollingDeploy, in)
 	if err != nil {

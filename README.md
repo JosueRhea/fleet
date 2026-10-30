@@ -63,6 +63,19 @@ From `hostd up examples/services.json`:
 
 This was measured on nested virtualization; expect bare metal to be faster. Cold boot is dominated by guest userspace startup plus the kernel. The restore cost scales with the size of the snapshotted RAM (it is a full, file-backed snapshot).
 
+## Full stack: Temporal Cloud → hostd agent → edge (`e2e/stack.sh`)
+
+No simulated parts: the Temporal worker writes `host.json`/`edge.json`, a real `hostd agent` boots Firecracker VMs and reports `host-status.json`, a real `edge` proxy routes traffic and reports `edge-status.json`, and the workflow gates on those reports. curl hits the edge every 10 ms during five deploys (2 replicas each):
+
+| Deploy | Result | What clients saw |
+|---|---|---|
+| v1 → v2 (rolling, surge 1) | active | 204× v1, 664× v2, 0 errors |
+| app exits on start | rolled_back (not ready, ~1 s) | 145× v2, 0 errors |
+| app returns 500 | rolled_back (edge error rate 100% in bake) | 267× v2, 487× 500 during the bake window |
+| v1 + manual rollback signal | rolled_back | 290× v1, 260× v2, 0 errors |
+
+After each deploy exactly 2 Firecracker processes remained; after shutdown 0 processes, 0 TAPs, 0 VM dirs. Rollbacks wake the snapshotted old instances (~30 ms). A bad release that passes readiness gets full traffic until the bake catches it; canary weights are the fix.
+
 ## Run it
 
 ```bash

@@ -1,3 +1,4 @@
+mod agent;
 mod firecracker;
 mod image;
 mod net;
@@ -40,6 +41,13 @@ enum Cmd {
     Image { reference: String },
     /// Run services from a desired-state file; re-reads it and reconciles every few seconds.
     Up { spec: PathBuf },
+    /// Run the instances in a host doc (from the control plane) and write status reports.
+    Agent {
+        #[arg(long)]
+        doc: PathBuf,
+        #[arg(long)]
+        status: PathBuf,
+    },
     /// Measure cold boot vs snapshot sleep/wake for one image.
     Bench {
         image: String,
@@ -120,6 +128,9 @@ impl Ctx {
         used.insert(idx);
         Ok(idx)
     }
+    fn gen_id(&self, name: &str) -> String {
+        format!("{name}-{}", self.next_gen.fetch_add(1, Ordering::SeqCst))
+    }
     fn free_slot(&self, idx: u8) {
         self.slots.lock().unwrap().remove(&idx);
     }
@@ -152,6 +163,10 @@ async fn main() -> Result<()> {
     if !init.exists() {
         bail!("guest init not found at {} (run scripts/build.sh)", init.display());
     }
+    let head = std::fs::read(&init)?;
+    if head.windows(8).take(4096).any(|w| w == b"/lib64/l" || w == b"/lib/ld-") {
+        bail!("guest init {} is dynamically linked; build it for musl (scripts/build.sh)", init.display());
+    }
     if !cli.kernel.exists() {
         bail!("guest kernel not found at {} (run scripts/fetch-kernel.sh)", cli.kernel.display());
     }
@@ -172,6 +187,7 @@ async fn main() -> Result<()> {
             tokio::task::spawn_blocking(move || bench(&ctx, &image, port, runs, vcpus, memory_mib)).await??
         }
         Cmd::Up { spec } => up(ctx, spec).await?,
+        Cmd::Agent { doc, status } => agent::run(ctx, doc, status).await?,
     }
     Ok(())
 }
@@ -274,7 +290,9 @@ fn bench(ctx: &Ctx, reference: &str, port: u16, runs: usize, vcpus: u8, memory_m
     Ok(())
 }
 
+/// Last `n` console lines, skipping the kernel's panic dump that follows init exiting.
 fn tail(s: &str, n: usize) -> String {
+    let s = s.find("Kernel panic").map_or(s, |i| &s[..i]);
     let lines: Vec<_> = s.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
@@ -377,7 +395,7 @@ async fn up(ctx: Arc<Ctx>, spec_path: PathBuf) -> Result<()> {
                 Some(r) if r.spec.public_port == s.public_port => {
                     log(format!("{name}: releasing {} (old instance keeps serving)", s.image));
                     let t = Instant::now();
-                    match boot_instance(&ctx, &s).await {
+                    match boot_instance(&ctx, &s, ctx.gen_id(&s.name)).await {
                         Ok(new) => {
                             let old = std::mem::replace(&mut *r.backend.write().unwrap(), new.clone());
                             r.watch.abort();
@@ -428,9 +446,8 @@ async fn up(ctx: Arc<Ctx>, spec_path: PathBuf) -> Result<()> {
 }
 
 /// Boot a new instance and return it only once it passes its readiness check.
-async fn boot_instance(ctx: &Arc<Ctx>, spec: &ServiceSpec) -> Result<Arc<Instance>> {
+async fn boot_instance(ctx: &Arc<Ctx>, spec: &ServiceSpec, id: String) -> Result<Arc<Instance>> {
     let idx = ctx.alloc_slot()?;
-    let id = format!("{}-{}", spec.name, ctx.next_gen.fetch_add(1, Ordering::SeqCst));
     let booted = tokio::task::spawn_blocking({
         let (ctx, spec, id) = (ctx.clone(), spec.clone(), id.clone());
         move || -> Result<(Vm, PathBuf)> {
@@ -472,7 +489,7 @@ async fn boot_instance(ctx: &Arc<Ctx>, spec: &ServiceSpec) -> Result<Arc<Instanc
 
 async fn start_service(ctx: Arc<Ctx>, spec: ServiceSpec) -> Result<Running> {
     let listener = TcpListener::bind(("0.0.0.0", spec.public_port)).await?;
-    let inst = boot_instance(&ctx, &spec).await?;
+    let inst = boot_instance(&ctx, &spec, ctx.gen_id(&spec.name)).await?;
     log(format!("{}: serving 0.0.0.0:{} -> {}", spec.name, spec.public_port, inst.id));
     let backend: Backend = Arc::new(std::sync::RwLock::new(inst.clone()));
     let accept = tokio::spawn(accept_loop(ctx.clone(), backend.clone(), listener));

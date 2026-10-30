@@ -1,0 +1,16 @@
+[package]
+name = "edge"
+version = "0.1.0"
+edition = "2021"
+description = "ccloud edge proxy: routes by Host from the edge doc, weighted backends, draining, passive health"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+ccloud-proto = { path = "../proto" }
+clap = { version = "4", features = ["derive"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

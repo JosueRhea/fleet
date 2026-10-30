@@ -1,0 +1,10 @@
+[package]
+name = "ccloud-proto"
+version = "0.1.0"
+edition = "2021"
+description = "ccloud desired-state documents (host doc, edge doc) and status reports"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

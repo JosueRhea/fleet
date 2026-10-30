@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/hostd", "crates/microinit"]
+members = ["crates/hostd", "crates/microinit", "crates/proto", "crates/edge"]
+default-members = ["crates/hostd", "crates/proto", "crates/edge"]
 
 [profile.release]
 strip = true
